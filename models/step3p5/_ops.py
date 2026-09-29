@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""[中文摘要] 跨 kernel 共享的 inline helper(zero-centered RMSNorm、per-head QK norm、
+"""[中文摘要] 跨 kernel 共享的 inline helper(zero-centered RMSNorm、
 partial RoPE、head-wise attention gate),以及 host 侧 llama3-yarn / 普通 RoPE
 cos/sin 表的 torch 生成函数。
 [关键装饰器] @pl.jit.inline(模块级 helper);本身不是独立 kernel,需要被 @pl.jit
@@ -31,12 +31,6 @@ Function names match the brief in MIGRATION_PLAN.md Phase 3 verbatim:
   - ``zero_centered_rmsnorm_apply(normed_fp32, gamma_slice)``
        Fold the +1.0 zero-centring shift into the per-channel gamma
        broadcast multiply: ``normed_fp32 * (gamma_slice + 1.0)``.
-
-  - ``per_head_qk_norm(qk_per_head, gamma_128)``
-       Per-head RMSNorm with a single [HEAD_DIM=128] zero-centred gamma
-       broadcast across all heads of the bundle. Used for both q_norm
-       (Q_PER_KV heads per KV head bundle) and k_norm (1 head per KV
-       head bundle).
 
   - ``partial_rope_rotate(lo, hi, cos_lo, cos_hi, sin_lo, sin_hi)``
        One (lo, hi) llama-style RoPE rotation step. The caller picks the
@@ -80,8 +74,6 @@ from __future__ import annotations
 
 import pypto.language as pl
 
-from .config import EPS, HEAD_DIM_INV
-
 
 # =============================================================================
 # Inline kernel helpers (run inside an InCore region).
@@ -108,29 +100,8 @@ def zero_centered_rmsnorm_apply(
     Returns:
         FP32 tile ``[rows, k]`` equal to ``normed_fp32 * (gamma + 1.0)``.
     """
-    gamma_eff = pl.adds(gamma_slice, 1.0)
+    gamma_eff = pl.add(gamma_slice, 1.0)
     return pl.col_expand_mul(normed_fp32, gamma_eff)
-
-
-@pl.jit.inline
-def per_head_qk_norm(
-    qk_per_head,    # pl.Tensor[[rows_per_head, HEAD_DIM], pl.FP32]
-    gamma_128,      # pl.Tensor[[1, HEAD_DIM], pl.FP32]  (stored, zero-centred)
-):
-    """Per-head zero-centred RMSNorm with a single shared [HEAD_DIM] gamma.
-
-    Step3p5 applies RMSNorm per head along the HEAD_DIM=128 axis BEFORE
-    RoPE. The same [HEAD_DIM] gamma vector is broadcast across all heads
-    in the bundle. Callers flatten their (batch, heads, HEAD_DIM) tile to
-    ``[rows_per_head, HEAD_DIM]`` then reshape back after this helper.
-
-    Returns:
-        FP32 tile ``[rows_per_head, HEAD_DIM]`` of normed activations.
-    """
-    sq = pl.row_sum(pl.mul(qk_per_head, qk_per_head))
-    inv = pl.rsqrt(pl.add(pl.mul(sq, HEAD_DIM_INV), EPS))
-    scaled = pl.row_expand_mul(qk_per_head, inv)
-    return zero_centered_rmsnorm_apply(scaled, gamma_128)
 
 
 @pl.jit.inline
@@ -291,7 +262,6 @@ def build_plain_rope_tables(
 
 __all__ = [
     "zero_centered_rmsnorm_apply",
-    "per_head_qk_norm",
     "partial_rope_rotate",
     "head_wise_gate_apply",
     "build_llama3_yarn_rope_tables",

@@ -106,9 +106,12 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # --- ACL IPC constants (mirror _stage_kvpool_pageattn.py / _stage_attn_backend.py) ---
 KEY_BUF = 256                      # aclrtIpcMemGetExportKey handle size
@@ -534,20 +537,48 @@ class WeightIpcExporter:
         }
 
     def teardown(self) -> int:
-        """Close the IPC export handle + free the pool (mirror _KvExporter.teardown)."""
+        """Close the IPC export handle + free the pool (mirror _KvExporter.teardown).
+
+        Each ACL call's return code is checked; a non-zero rc (or an exception)
+        is logged instead of silently swallowed, so a teardown that fails to
+        release the export key / HBM pool is visible in the exporter log rather
+        than leaving device residue that poisons the next exporter start.
+        Returns the number of ACL release calls that reported success.
+        """
         closed = 0
         if self._export_key is not None:
             try:
-                if self._acl.aclrtIpcMemClose(self._export_key) == 0:
+                rc = self._acl.aclrtIpcMemClose(self._export_key)
+                if rc == 0:
                     closed += 1
-            except Exception:  # noqa: BLE001
-                pass
+                else:
+                    print(
+                        f"[weight-ipc exporter] WARN aclrtIpcMemClose rc={rc}",
+                        flush=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[weight-ipc exporter] WARN aclrtIpcMemClose raised {exc!r}",
+                    flush=True,
+                )
             self._export_key = None
         if self._pool_ptr is not None:
             try:
-                self._acl.aclrtFree(ctypes.c_void_p(self._pool_ptr))
-            except Exception:  # noqa: BLE001
-                pass
+                rc = self._acl.aclrtFree(ctypes.c_void_p(self._pool_ptr))
+                if rc == 0:
+                    closed += 1
+                else:
+                    print(
+                        f"[weight-ipc exporter] WARN aclrtFree rc={rc} "
+                        f"pool={hex(self._pool_ptr)}",
+                        flush=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[weight-ipc exporter] WARN aclrtFree raised {exc!r} "
+                    f"pool={hex(self._pool_ptr)}",
+                    flush=True,
+                )
             self._pool_ptr = None
         if self._ipc_owner is not None:
             try:
@@ -555,6 +586,85 @@ class WeightIpcExporter:
             finally:
                 self._ipc_owner = None
         return closed
+
+
+def _ckpt_mtime(ckpt_dir):
+    """Return the checkpoint's mtime tag from the first present index/shard file.
+
+    Mirrors ``weight_loader._read_index``'s candidate order (HF standard index,
+    then Ascend W8A8 index, then the single-shard fallback) so the cache key
+    actually changes when the checkpoint is updated. Returns 0 (with a warning)
+    only when none of the candidates exist.
+    """
+    for name in (
+        "model.safetensors.index.json",
+        "quant_model_weights.safetensors.index.json",
+        "model.safetensors",
+    ):
+        p = os.path.join(ckpt_dir, name)
+        if os.path.isfile(p):
+            return int(os.path.getmtime(p))
+    logger.warning("no safetensors index/shard for mtime; cache key unstable")
+    return 0
+
+
+def _load_bundle_cached(ckpt_dir, rank, tp_world_size, *, int8_routed, layer_lo, layer_hi):
+    """Cache-first weight bundle loader for the whole-net exporter.
+
+    Opt-in via ``PYPTO_STEP3P5_WEIGHT_CACHE_DIR`` (no default: unset disables
+    the cache entirely). The cache key embeds the checkpoint mtime so an updated
+    checkpoint cannot silently reuse stale weights. A cache hit ``torch.load``s
+    the raw bundle; a miss loads normally then writes atomically (tmp + rename).
+    Every read/write failure degrades silently to the normal load — the cache is
+    best-effort and must never break the exporter.
+    """
+    import torch  # noqa: PLC0415
+    from models.step3p5.config import (  # noqa: PLC0415
+        NUM_HIDDEN_LAYERS,
+        TP_WORLD_SIZE,
+    )
+    from models.step3p5.weight_loader import (  # noqa: PLC0415
+        load_step3p5_weights_for_rank,
+    )
+
+    cache_dir = os.environ.get("PYPTO_STEP3P5_WEIGHT_CACHE_DIR")  # no default
+    cache_eligible = (
+        cache_dir is not None
+        and int8_routed is True
+        and layer_lo == 0
+        and layer_hi == NUM_HIDDEN_LAYERS
+        and tp_world_size == TP_WORLD_SIZE
+    )
+    cache_path = None
+    if cache_eligible:
+        # checkpoint mtime tag (anti-staleness): mirror _read_index's candidate
+        # order so the key changes when the checkpoint is updated.
+        ckpt_mtime = _ckpt_mtime(ckpt_dir)
+        cache_path = os.path.join(cache_dir, f"rank{rank}.{ckpt_mtime}.pt")
+        # read cache: best-effort, silently degrade to normal load on failure.
+        try:
+            if os.path.exists(cache_path):
+                return torch.load(cache_path, map_location="cpu", weights_only=True)
+        except Exception:
+            pass
+    bundle = load_step3p5_weights_for_rank(
+        ckpt_dir, rank, tp_world_size,
+        int8_routed=int8_routed, layer_lo=layer_lo, layer_hi=layer_hi,
+    )
+    if cache_eligible:
+        # atomic write-back (tmp + os.replace); on failure degrade silently and
+        # clean up the partial tmp.
+        tmp_path = cache_path + f".tmp.{os.getpid()}"
+        try:
+            torch.save(bundle, tmp_path)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+    return bundle
 
 
 def _prepare_checkpoint_bundle(
@@ -565,18 +675,32 @@ def _prepare_checkpoint_bundle(
     int8_routed: bool = False,
     kv_ipc: bool = False,
     production_hidden_only: bool = False,
+    layer_lo: int = 0,
+    layer_hi: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Load and normalize one rank's checkpoint bundle for the PyPTO ABI."""
+    """Load and normalize one rank's checkpoint bundle for the PyPTO ABI.
+
+    ``layer_lo``/``layer_hi`` restrict the MoE stacks only (see
+    ``load_step3p5_weights_for_rank``); ``layer_hi=None`` loads all layers.
+    """
     from models.step3p5.weight_loader import (  # noqa: PLC0415
-        load_step3p5_weights_for_rank,
+        moe_slice_params,
         verify_bundle_shapes,
     )
     import torch  # noqa: PLC0415
 
-    bundle = load_step3p5_weights_for_rank(
+    if layer_hi is None:
+        from models.step3p5.config import NUM_HIDDEN_LAYERS  # noqa: PLC0415
+        layer_hi = NUM_HIDDEN_LAYERS
+    _, n_moe_layers, _ = moe_slice_params(layer_lo, layer_hi)
+
+    bundle = _load_bundle_cached(
         ckpt_dir, rank, tp_world_size, int8_routed=int8_routed,
+        layer_lo=layer_lo, layer_hi=layer_hi,
     )
-    verify_bundle_shapes(bundle, tp_world_size)
+    verify_bundle_shapes(
+        bundle, tp_world_size, int8_routed=int8_routed, n_moe_layers=n_moe_layers,
+    )
     # The whole_decode host_orch expects FP32 for the norm weights + final_norm
     # (matching the dummy device harness), but weight_loader stores norms as bf16.
     # Zero-copy IPC cannot cast at read time, so materialize FP32 bytes here so the
@@ -652,6 +776,8 @@ def export_from_checkpoint_resident(
     int8_routed: bool = False,
     kv_ipc: bool = False,
     production_hidden_only: bool = False,
+    layer_lo: int = 0,
+    layer_hi: Optional[int] = None,
 ) -> Tuple[WeightIpcExporter, Dict[str, Any], Dict[str, Any]]:
     """Export one rank and return the owner object plus the host bundle.
 
@@ -667,6 +793,8 @@ def export_from_checkpoint_resident(
         int8_routed=int8_routed,
         kv_ipc=kv_ipc,
         production_hidden_only=production_hidden_only,
+        layer_lo=layer_lo,
+        layer_hi=layer_hi,
     )
     exporter = WeightIpcExporter(dev)
     summary = exporter.export(
@@ -876,6 +1004,8 @@ def export_from_checkpoint(
     int8_routed: bool = False,
     kv_ipc: bool = False,
     production_hidden_only: bool = False,
+    layer_lo: int = 0,
+    layer_hi: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Convenience: load a rank bundle from a checkpoint + export it.
 
@@ -903,6 +1033,8 @@ def export_from_checkpoint(
         int8_routed=int8_routed,
         kv_ipc=kv_ipc,
         production_hidden_only=production_hidden_only,
+        layer_lo=layer_lo,
+        layer_hi=layer_hi,
     )
     # Historical standalone callers intentionally keep the raw allocation
     # alive until process exit.  No __del__ tears it down.

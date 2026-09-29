@@ -946,12 +946,10 @@ def _build_prefill_moe_program(
                         )
                         silu = pl.mul(gate_acc, sigmoid)
                         if _routed_swiglu_step:
-                            silu_c = pl.minimum(silu, _routed_swiglu_limit)
-                            up_c = pl.maximum(
-                                pl.minimum(up_acc, _routed_swiglu_limit),
-                                -_routed_swiglu_limit,
-                            )
-                            gated = pl.mul(silu_c, up_c)
+                            silu = pl.minimum(silu, _routed_swiglu_limit)
+                            up_acc = pl.minimum(up_acc, _routed_swiglu_limit)
+                            up_acc = pl.maximum(up_acc, -_routed_swiglu_limit)
+                            gated = pl.mul(silu, up_acc)
                         else:
                             gated = pl.mul(silu, up_acc)
 
@@ -1059,6 +1057,8 @@ def _build_prefill_moe_program(
             return local_routed_y
 
         # ---------- Stage 3b: expert_shared (TP-sliced + tp_all_reduce) ----
+        # KNOWN-BUGGY: single [BATCH,160] tile crosses the N=128 boundary (wide-tile
+        # tmov misprune). Superseded by prefill_expert_shared [32]x5; no golden before #9 removes it.
         @pl.function(type=pl.FunctionType.Inline)
         def _expert_shared_local(
             self,

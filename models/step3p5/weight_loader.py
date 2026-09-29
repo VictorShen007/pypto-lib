@@ -131,6 +131,13 @@ NUM_MTP = NUM_NEXTN_PREDICT_LAYERS
 MTP_HIDDEN_LOCAL = HIDDEN // TP_WORLD_SIZE  # 512 — eh_proj row-slice output dim
 EH_IN = 2 * HIDDEN
 
+# Ascend INT8 FRACTAL_NZ physical fractal.  For a logical [..., M, N]
+# projector the resident byte order is [..., N1, M1, M0, N0], where
+# M0=16 and N0=32.  These are byte-layout constants, not tunable tiles.
+FRACTAL_NZ_M0 = 16
+FRACTAL_NZ_N0_INT8 = 32
+ROUTED_WEIGHT_LAYOUT_NZ = "FRACTAL_NZ"
+
 # Default checkpoint location on the Ascend network share.
 DEFAULT_CKPT_DIR = (
     "/mnt/chensiyu-jfs/multi-hardware/models/"
@@ -174,6 +181,14 @@ KEY_MOE_W_DOWN_R = "moe_w_down_r"
 KEY_MOE_W_GATE_R_SCALE = "moe_w_gate_r_scale"
 KEY_MOE_W_UP_R_SCALE = "moe_w_up_r_scale"
 KEY_MOE_W_DOWN_R_SCALE = "moe_w_down_r_scale"
+# csy native-W8A8 decode variants (used only when ``decode_native_moe=True``):
+# W13 merges routed gate+up into one ``[.., H, 2*INTERMEDIATE]`` projector; the
+# _NK keys keep the checkpoint-native ``[N, K]`` orientation for b_trans matmuls.
+KEY_MOE_W13_R = "moe_w13_r"
+KEY_MOE_W13_R_SCALE = "moe_w13_r_scale"
+KEY_MOE_GATE_W_NK = "moe_gate_w_nk"
+KEY_MOE_W_GATE_S_NK = "moe_w_gate_s_nk"
+KEY_MOE_W_UP_S_NK = "moe_w_up_s_nk"
 KEY_MOE_W_GATE_S = "moe_w_gate_s"
 KEY_MOE_W_UP_S = "moe_w_up_s"
 KEY_MOE_W_DOWN_S = "moe_w_down_s"
@@ -201,8 +216,41 @@ KEY_MTP_DENSE_DOWN = "mtp_dense_w_down"
 # Expected per-rank bundle shape table — single source of truth.
 # Used by both ``verify_bundle_shapes`` and the bundle constructor.
 # =============================================================================
-def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, ...]]:
-    """Per-rank expected shape for every bundle key."""
+def moe_slice_params(
+    layer_lo: int, layer_hi: int,
+) -> tuple[int, int, int]:
+    """Return ``(moe_base, n_moe_layers, moe_off)`` for a ``[layer_lo, layer_hi)`` run.
+
+    Mirrors the derivation in ``prefill_fwd._build_prefill_fwd_program`` and the
+    prefill holder: ``moe_base = max(layer_lo, NUM_DENSE_LAYERS)`` rebases the MoE
+    slot, ``n_moe_layers`` is the count of MoE layers the active range covers
+    (floored at 1), and ``moe_off = moe_base - NUM_DENSE_LAYERS`` is the offset
+    into ``MOE_LAYER_INDICES``.  Only the MoE stacks are sized by ``n_moe_layers``;
+    attention/dense/norm stacks stay full-sized regardless of the range.
+    """
+    moe_base = max(layer_lo, NUM_DENSE_LAYERS)
+    n_moe_layers = max(1, min(layer_hi, NUM_HIDDEN_LAYERS) - moe_base)
+    moe_off = moe_base - NUM_DENSE_LAYERS
+    return moe_base, n_moe_layers, moe_off
+
+
+def expected_shapes(
+    tp_world_size: int = TP_WORLD_SIZE, int8_routed: bool = False,
+    n_moe_layers: int | None = None,
+    *,
+    decode_native_moe: bool = False,
+) -> dict[str, tuple[int, ...]]:
+    """Per-rank expected shape for every bundle key.
+
+    ``int8_routed=False`` (BF16 routed experts) omits the three per-output-
+    channel scale keys; ``int8_routed=True`` (native W8A8) includes them.
+    ``n_moe_layers=None`` defaults to the full ``NUM_MOE_LAYERS``; pass a smaller
+    count to size the 8 MoE stacks for a restricted ``[layer_lo, layer_hi)`` run.
+    ``decode_native_moe=True`` replaces the gate/up-separate routed and shared
+    keys with the merged W13 projector and checkpoint-native ``[N, K]`` keys.
+    """
+    if n_moe_layers is None:
+        n_moe_layers = NUM_MOE_LAYERS
     num_heads_full_local = NUM_HEADS_FULL // tp_world_size
     num_heads_swa_local = NUM_HEADS_SWA // tp_world_size
     # Gate weights are zero-padded to the kernel tile width (NUM_HEADS_*_LOCAL_PAD).
@@ -220,7 +268,7 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
     kv_hidden_local = kv_heads_local * HEAD_DIM
     hidden_local = HIDDEN // tp_world_size
 
-    return {
+    shapes = {
         # Replicated
         KEY_EMBED: (VOCAB, HIDDEN),
         KEY_FINAL_NORM: (HIDDEN,),
@@ -228,8 +276,8 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
         KEY_POST_ATTN_RMS: (NUM_HIDDEN_LAYERS, HIDDEN),
         KEY_Q_NORM: (NUM_HIDDEN_LAYERS, HEAD_DIM),
         KEY_K_NORM: (NUM_HIDDEN_LAYERS, HEAD_DIM),
-        KEY_MOE_GATE_W: (NUM_MOE_LAYERS, HIDDEN, MOE_NUM_EXPERTS),
-        KEY_MOE_ROUTER_BIAS: (NUM_MOE_LAYERS, MOE_NUM_EXPERTS),
+        KEY_MOE_GATE_W: (n_moe_layers, HIDDEN, MOE_NUM_EXPERTS),
+        KEY_MOE_ROUTER_BIAS: (n_moe_layers, MOE_NUM_EXPERTS),
         # TP-sliced (attention — full)
         KEY_WQ_FULL: (NUM_FULL_LAYERS, HIDDEN, hidden_q_full_local),
         KEY_WK_FULL: (NUM_FULL_LAYERS, HIDDEN, kv_hidden_local),
@@ -247,18 +295,18 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
         KEY_DENSE_UP: (NUM_DENSE_LAYERS, HIDDEN, intermediate_local),
         KEY_DENSE_DOWN: (NUM_DENSE_LAYERS, intermediate_local, HIDDEN),
         # TP-sliced (MoE shared expert)
-        KEY_MOE_W_GATE_S: (NUM_MOE_LAYERS, HIDDEN, share_expert_dim_local),
-        KEY_MOE_W_UP_S: (NUM_MOE_LAYERS, HIDDEN, share_expert_dim_local),
-        KEY_MOE_W_DOWN_S: (NUM_MOE_LAYERS, share_expert_dim_local, HIDDEN),
+        KEY_MOE_W_GATE_S: (n_moe_layers, HIDDEN, share_expert_dim_local),
+        KEY_MOE_W_UP_S: (n_moe_layers, HIDDEN, share_expert_dim_local),
+        KEY_MOE_W_DOWN_S: (n_moe_layers, share_expert_dim_local, HIDDEN),
         # EP-sliced routed experts
         KEY_MOE_W_GATE_R: (
-            NUM_MOE_LAYERS, moe_num_experts_local, HIDDEN, MOE_INTERMEDIATE,
+            n_moe_layers, moe_num_experts_local, HIDDEN, MOE_INTERMEDIATE,
         ),
         KEY_MOE_W_UP_R: (
-            NUM_MOE_LAYERS, moe_num_experts_local, HIDDEN, MOE_INTERMEDIATE,
+            n_moe_layers, moe_num_experts_local, HIDDEN, MOE_INTERMEDIATE,
         ),
         KEY_MOE_W_DOWN_R: (
-            NUM_MOE_LAYERS, moe_num_experts_local, MOE_INTERMEDIATE, HIDDEN,
+            n_moe_layers, moe_num_experts_local, MOE_INTERMEDIATE, HIDDEN,
         ),
         # TP-sliced LM head
         KEY_LM_HEAD: (vocab_local, HIDDEN),
@@ -282,6 +330,51 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
         KEY_MTP_DENSE_UP: (NUM_MTP, HIDDEN, intermediate_local),
         KEY_MTP_DENSE_DOWN: (NUM_MTP, intermediate_local, HIDDEN),
     }
+    if int8_routed:
+        shapes[KEY_MOE_W_GATE_R_SCALE] = (
+            n_moe_layers, moe_num_experts_local, MOE_INTERMEDIATE,
+        )
+        shapes[KEY_MOE_W_UP_R_SCALE] = (
+            n_moe_layers, moe_num_experts_local, MOE_INTERMEDIATE,
+        )
+        shapes[KEY_MOE_W_DOWN_R_SCALE] = (
+            n_moe_layers, moe_num_experts_local, HIDDEN,
+        )
+    if decode_native_moe:
+        # Native-MoE decode replaces the legacy gate/up-separate routed and
+        # shared keys with the merged W13 projector and checkpoint-native
+        # [N, K] router / shared keys consumed by the b_trans matmuls.
+        shapes.pop(KEY_MOE_W_GATE_R)
+        shapes.pop(KEY_MOE_W_UP_R)
+        shapes[KEY_MOE_W13_R] = (
+            routed_int8_nz_shape(
+                (n_moe_layers, moe_num_experts_local, HIDDEN, 2 * MOE_INTERMEDIATE),
+            )
+            if int8_routed
+            else (n_moe_layers, moe_num_experts_local, HIDDEN, 2 * MOE_INTERMEDIATE)
+        )
+        if int8_routed:
+            shapes.pop(KEY_MOE_W_GATE_R_SCALE)
+            shapes.pop(KEY_MOE_W_UP_R_SCALE)
+            shapes[KEY_MOE_W13_R_SCALE] = (
+                n_moe_layers, moe_num_experts_local, 2 * MOE_INTERMEDIATE,
+            )
+            shapes[KEY_MOE_W_DOWN_R] = routed_int8_nz_shape(
+                (n_moe_layers, moe_num_experts_local, MOE_INTERMEDIATE, HIDDEN),
+            )
+        shapes.pop(KEY_MOE_GATE_W)
+        shapes[KEY_MOE_GATE_W_NK] = (
+            n_moe_layers, MOE_NUM_EXPERTS, HIDDEN,
+        )
+        shapes.pop(KEY_MOE_W_GATE_S)
+        shapes.pop(KEY_MOE_W_UP_S)
+        shapes[KEY_MOE_W_GATE_S_NK] = (
+            n_moe_layers, share_expert_dim_local, HIDDEN,
+        )
+        shapes[KEY_MOE_W_UP_S_NK] = (
+            n_moe_layers, share_expert_dim_local, HIDDEN,
+        )
+    return shapes
 
 
 # =============================================================================
@@ -611,6 +704,15 @@ def _slice_mlp_col(
     return _to_bf16(out.transpose(0, 1).contiguous())          # [HIDDEN, DIM_LOCAL]
 
 
+def _slice_mlp_col_native(
+    w_full: "torch.Tensor", rank: int, dim_local: int,
+) -> "torch.Tensor":
+    """Keep a TP column slice in checkpoint-native ``[N, K]`` layout."""
+    lo = rank * dim_local
+    hi = lo + dim_local
+    return _to_bf16(w_full[lo:hi, :].contiguous())
+
+
 def _slice_mlp_row(
     w_full: "torch.Tensor", rank: int, dim_local: int,
 ) -> "torch.Tensor":
@@ -655,6 +757,131 @@ def _transpose_routed_block(t: "torch.Tensor") -> "torch.Tensor":
     return t.transpose(-2, -1).contiguous()
 
 
+def routed_int8_nz_shape(logical_shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Return the physical INT8 FRACTAL_NZ shape for logical ``[..., M, N]``.
+
+    The returned shape describes actual resident bytes and is therefore the
+    shape exported through IPC and declared by the native decode program.  It
+    must never be interpreted as a logical ND matrix.
+    """
+    if len(logical_shape) < 2:
+        raise ValueError(f"NZ logical shape must have at least two axes: {logical_shape}")
+    *prefix, m, n = (int(dim) for dim in logical_shape)
+    if m <= 0 or n <= 0:
+        raise ValueError(f"NZ logical matrix axes must be positive: {logical_shape}")
+    if m % FRACTAL_NZ_M0 != 0 or n % FRACTAL_NZ_N0_INT8 != 0:
+        raise ValueError(
+            "INT8 FRACTAL_NZ requires M divisible by 16 and N divisible by 32; "
+            f"got M={m}, N={n}",
+        )
+    return (
+        *prefix,
+        n // FRACTAL_NZ_N0_INT8,
+        m // FRACTAL_NZ_M0,
+        FRACTAL_NZ_M0,
+        FRACTAL_NZ_N0_INT8,
+    )
+
+
+def pack_int8_fractal_nz(logical: "torch.Tensor") -> "torch.Tensor":
+    """Pack logical contiguous ``[..., M, N]`` INT8 bytes into FRACTAL_NZ.
+
+    This pure-host transform matches ``torch_npu.npu_format_cast(..., 29)``:
+    ``reshape(..., M1, 16, N1, 32).permute(..., N1, M1, 16, 32)``.
+    """
+    if str(logical.dtype) != "torch.int8":
+        raise TypeError(f"FRACTAL_NZ routed weight must be torch.int8, got {logical.dtype}")
+    logical_shape = tuple(int(dim) for dim in logical.shape)
+    physical_shape = routed_int8_nz_shape(logical_shape)
+    prefix = logical_shape[:-2]
+    m, n = logical_shape[-2:]
+    prefix_ndim = len(prefix)
+    reshaped = logical.contiguous().reshape(
+        *prefix,
+        m // FRACTAL_NZ_M0,
+        FRACTAL_NZ_M0,
+        n // FRACTAL_NZ_N0_INT8,
+        FRACTAL_NZ_N0_INT8,
+    )
+    order = [
+        *range(prefix_ndim),
+        prefix_ndim + 2,
+        prefix_ndim,
+        prefix_ndim + 1,
+        prefix_ndim + 3,
+    ]
+    packed = reshaped.permute(*order).contiguous()
+    if tuple(packed.shape) != physical_shape:
+        raise AssertionError(
+            f"internal FRACTAL_NZ shape mismatch: got {tuple(packed.shape)}, "
+            f"want {physical_shape}",
+        )
+    return packed
+
+
+def unpack_int8_fractal_nz(
+    packed: "torch.Tensor",
+    logical_shape: tuple[int, ...],
+) -> "torch.Tensor":
+    """Host-only inverse used by golden/reference checks, never by decode."""
+    if str(packed.dtype) != "torch.int8":
+        raise TypeError(f"FRACTAL_NZ routed weight must be torch.int8, got {packed.dtype}")
+    logical_shape = tuple(int(dim) for dim in logical_shape)
+    expected = routed_int8_nz_shape(logical_shape)
+    if tuple(packed.shape) != expected:
+        raise ValueError(
+            f"packed FRACTAL_NZ shape {tuple(packed.shape)} != expected {expected}",
+        )
+    prefix = logical_shape[:-2]
+    prefix_ndim = len(prefix)
+    restored = packed.permute(
+        *range(prefix_ndim),
+        prefix_ndim + 1,
+        prefix_ndim + 2,
+        prefix_ndim,
+        prefix_ndim + 3,
+    ).contiguous()
+    return restored.reshape(logical_shape)
+
+
+def _flatten_routed_output_scale(scale: "torch.Tensor") -> "torch.Tensor":
+    """Normalize a routed per-output scale slab to ``[E, N]`` FP32 layout."""
+    if scale.ndim >= 2 and scale.shape[-1] == 1:
+        scale = scale.squeeze(-1)
+    return scale.contiguous()
+
+
+def _pack_routed_w13(
+    gate: "torch.Tensor",
+    up: "torch.Tensor",
+) -> "torch.Tensor":
+    """Pack checkpoint gate/up ``[E, I, H]`` into logical W13 ``[E, H, 2I]``."""
+    import torch  # noqa: PLC0415
+
+    if tuple(gate.shape) != tuple(up.shape):
+        raise ValueError(
+            f"routed gate/up shapes differ: {tuple(gate.shape)} vs {tuple(up.shape)}",
+        )
+    return _transpose_routed_block(torch.cat((gate, up), dim=-2))
+
+
+def _pack_routed_w13_scale(
+    gate_scale: "torch.Tensor",
+    up_scale: "torch.Tensor",
+) -> "torch.Tensor":
+    """Pack gate/up per-output scales into logical ``[E, 2I]`` order."""
+    import torch  # noqa: PLC0415
+
+    gate_flat = _flatten_routed_output_scale(gate_scale)
+    up_flat = _flatten_routed_output_scale(up_scale)
+    if tuple(gate_flat.shape) != tuple(up_flat.shape):
+        raise ValueError(
+            "routed gate/up scale shapes differ: "
+            f"{tuple(gate_flat.shape)} vs {tuple(up_flat.shape)}",
+        )
+    return torch.cat((gate_flat, up_flat), dim=-1).contiguous()
+
+
 # =============================================================================
 # Public entry — build a per-rank bundle from the on-disk checkpoint.
 # =============================================================================
@@ -664,6 +891,9 @@ def load_step3p5_weights_for_rank(
     tp_world_size: int = TP_WORLD_SIZE,
     *,
     int8_routed: bool = False,
+    layer_lo: int = 0,
+    layer_hi: int = NUM_HIDDEN_LAYERS,
+    decode_native_moe: bool = False,
 ) -> dict[str, "torch.Tensor"]:
     """Construct rank ``rank``'s weight bundle from the HF safetensors ckpt.
 
@@ -673,6 +903,16 @@ def load_step3p5_weights_for_rank(
     (rank + 1) * MOE_NUM_EXPERTS_LOCAL``). Replicated tensors are copied
     verbatim.
 
+    ``layer_lo``/``layer_hi`` restrict ONLY the MoE stacks (the 8 keys sized
+    by ``n_moe_layers`` in the prefill program): attention/dense/norm stacks
+    stay full-sized because ``whole_chip_orch`` declares them against the full
+    layer counts.  The default ``[0, NUM_HIDDEN_LAYERS)`` loads everything.
+
+    ``decode_native_moe=True`` switches the MoE keys to the native-W8A8
+    decode ABI: routed gate/up merge into a FRACTAL_NZ W13 projector and the
+    router / shared gate/up use checkpoint-native ``[N, K]`` keys for b_trans
+    matmuls.  Default ``False`` keeps the legacy gate/up-separate layout.
+
     Returns a flat dict of named ``torch.Tensor``s. Caller stacks them
     along a leading rank axis when constructing a full 8-rank decode
     invocation (see the hidden-only Main/MTP holders).
@@ -681,12 +921,19 @@ def load_step3p5_weights_for_rank(
         raise ValueError(
             f"rank {rank} out of range [0, {tp_world_size})",
         )
+    if not (0 <= layer_lo < layer_hi <= NUM_HIDDEN_LAYERS):
+        raise ValueError(
+            f"layer range [{layer_lo}, {layer_hi}) must satisfy "
+            f"0 <= layer_lo < layer_hi <= NUM_HIDDEN_LAYERS={NUM_HIDDEN_LAYERS}"
+        )
     if tp_world_size != TP_WORLD_SIZE:
         log.warning(
             "tp_world_size=%d does not match config.TP_WORLD_SIZE=%d; "
             "slicing math uses the supplied value.",
             tp_world_size, TP_WORLD_SIZE,
         )
+    _moe_base, _n_moe_layers, _moe_off = moe_slice_params(layer_lo, layer_hi)
+    moe_indices = MOE_LAYER_INDICES[_moe_off:_moe_off + _n_moe_layers]
 
     import torch  # noqa: PLC0415
 
@@ -830,13 +1077,16 @@ def load_step3p5_weights_for_rank(
         routed_gate_rows: list[torch.Tensor] = []
         routed_up_rows: list[torch.Tensor] = []
         routed_down_rows: list[torch.Tensor] = []
+        routed_w13_rows: list[torch.Tensor] = []
         # INT8-native routed collectors (used only when int8_routed=True).
         routed_gate_rows_i8: list[torch.Tensor] = []
         routed_up_rows_i8: list[torch.Tensor] = []
         routed_down_rows_i8: list[torch.Tensor] = []
+        routed_w13_rows_i8: list[torch.Tensor] = []
         routed_gate_scale_rows: list[torch.Tensor] = []
         routed_up_scale_rows: list[torch.Tensor] = []
         routed_down_scale_rows: list[torch.Tensor] = []
+        routed_w13_scale_rows: list[torch.Tensor] = []
         share_gate_rows: list[torch.Tensor] = []
         share_up_rows: list[torch.Tensor] = []
         share_down_rows: list[torch.Tensor] = []
@@ -844,13 +1094,16 @@ def load_step3p5_weights_for_rank(
         ep_lo = ep_global_expert_id(rank, 0)
         ep_hi = ep_lo + moe_num_experts_local
 
-        for li in MOE_LAYER_INDICES:
+        for li in moe_indices:
             moe = _hf_moe_keys(li)
             # gate matmul is stored as ``[NUM_EXPERTS, HIDDEN]`` and is
             # used in FP32; we transpose to ``[HIDDEN, NUM_EXPERTS]`` to
-            # match the gate kernel's signature.
+            # match the gate kernel's signature.  decode_native_moe keeps the
+            # checkpoint-native ``[N, K]`` orientation for the b_trans matmul.
             gate_w = _to_fp32(cache.get(moe["gate_w"]))
             if gate_w.shape[0] == MOE_NUM_EXPERTS and gate_w.shape[1] == HIDDEN:
+                gate_w = gate_w.transpose(0, 1).contiguous()
+            if decode_native_moe:
                 gate_w = gate_w.transpose(0, 1).contiguous()
             gate_w_rows.append(gate_w)
             router_bias_rows.append(_to_fp32(cache.get(moe["router_bias"])))
@@ -879,15 +1132,29 @@ def load_step3p5_weights_for_rank(
                             for eid in range(ep_lo, ep_hi)]
                 down_pairs = [_load_quantized_expert_projector_int8(cache, li, eid, "down_proj")
                               for eid in range(ep_lo, ep_hi)]
-                routed_gate_rows_i8.append(_transpose_routed_block(
-                    torch.stack([w for w, _ in gate_pairs], dim=0)))
-                routed_up_rows_i8.append(_transpose_routed_block(
-                    torch.stack([w for w, _ in up_pairs], dim=0)))
-                routed_down_rows_i8.append(_transpose_routed_block(
-                    torch.stack([w for w, _ in down_pairs], dim=0)))
-                routed_gate_scale_rows.append(torch.stack([s for _, s in gate_pairs], dim=0))
-                routed_up_scale_rows.append(torch.stack([s for _, s in up_pairs], dim=0))
-                routed_down_scale_rows.append(torch.stack([s for _, s in down_pairs], dim=0))
+                if decode_native_moe:
+                    gate_slab_i8 = torch.stack([w for w, _ in gate_pairs], dim=0)
+                    up_slab_i8 = torch.stack([w for w, _ in up_pairs], dim=0)
+                    routed_w13_rows_i8.append(pack_int8_fractal_nz(
+                        _pack_routed_w13(gate_slab_i8, up_slab_i8)))
+                    routed_down_rows_i8.append(pack_int8_fractal_nz(
+                        _transpose_routed_block(
+                            torch.stack([w for w, _ in down_pairs], dim=0))))
+                    routed_w13_scale_rows.append(_pack_routed_w13_scale(
+                        torch.stack([s for _, s in gate_pairs], dim=0),
+                        torch.stack([s for _, s in up_pairs], dim=0)))
+                    routed_down_scale_rows.append(
+                        torch.stack([s for _, s in down_pairs], dim=0))
+                else:
+                    routed_gate_rows_i8.append(_transpose_routed_block(
+                        torch.stack([w for w, _ in gate_pairs], dim=0)))
+                    routed_up_rows_i8.append(_transpose_routed_block(
+                        torch.stack([w for w, _ in up_pairs], dim=0)))
+                    routed_down_rows_i8.append(_transpose_routed_block(
+                        torch.stack([w for w, _ in down_pairs], dim=0)))
+                    routed_gate_scale_rows.append(torch.stack([s for _, s in gate_pairs], dim=0))
+                    routed_up_scale_rows.append(torch.stack([s for _, s in up_pairs], dim=0))
+                    routed_down_scale_rows.append(torch.stack([s for _, s in down_pairs], dim=0))
             else:
                 if _has_quantized_routed_experts(weight_map, li):
                     gate_slab = torch.stack([
@@ -913,39 +1180,72 @@ def load_step3p5_weights_for_rank(
                     up_slab = up_full[ep_lo:ep_hi].contiguous()
                     down_slab = down_full[ep_lo:ep_hi].contiguous()
 
-                routed_gate_rows.append(_to_bf16(_transpose_routed_block(gate_slab)))
-                routed_up_rows.append(_to_bf16(_transpose_routed_block(up_slab)))
+                if decode_native_moe:
+                    routed_w13_rows.append(_to_bf16(_pack_routed_w13(gate_slab, up_slab)))
+                else:
+                    routed_gate_rows.append(_to_bf16(_transpose_routed_block(gate_slab)))
+                    routed_up_rows.append(_to_bf16(_transpose_routed_block(up_slab)))
                 routed_down_rows.append(_to_bf16(_transpose_routed_block(down_slab)))
 
-            # Shared expert: TP-sliced like dense MLP.
-            share_gate_rows.append(_slice_mlp_col(
+            # Shared expert: TP-sliced like dense MLP.  decode_native_moe keeps
+            # the checkpoint-native [N, K] orientation for the b_trans matmul.
+            slice_shared = (
+                _slice_mlp_col_native if decode_native_moe else _slice_mlp_col
+            )
+            share_gate_rows.append(slice_shared(
                 cache.get(moe["share_gate"]), rank, share_expert_dim_local,
             ))
-            share_up_rows.append(_slice_mlp_col(
+            share_up_rows.append(slice_shared(
                 cache.get(moe["share_up"]), rank, share_expert_dim_local,
             ))
             share_down_rows.append(_slice_mlp_row(
                 cache.get(moe["share_down"]), rank, share_expert_dim_local,
             ))
 
-        bundle[KEY_MOE_GATE_W] = torch.stack(gate_w_rows, dim=0)
+        gate_key = KEY_MOE_GATE_W_NK if decode_native_moe else KEY_MOE_GATE_W
+        bundle[gate_key] = torch.stack(gate_w_rows, dim=0)
         bundle[KEY_MOE_ROUTER_BIAS] = torch.stack(router_bias_rows, dim=0)
         if int8_routed:
-            bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows_i8, dim=0)
-            bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows_i8, dim=0)
-            bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows_i8, dim=0)
-            # Per-output-channel scale is [.., N] (2D per expert); the projector
-            # returns a [.., N, 1] column, so squeeze the trailing singleton to
-            # match the kernel/program signature [tp_size, N_MOE, EXPL, N].
-            bundle[KEY_MOE_W_GATE_R_SCALE] = torch.stack(routed_gate_scale_rows, dim=0).squeeze(-1)
-            bundle[KEY_MOE_W_UP_R_SCALE] = torch.stack(routed_up_scale_rows, dim=0).squeeze(-1)
-            bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0).squeeze(-1)
+            if decode_native_moe:
+                bundle[KEY_MOE_W13_R] = torch.stack(routed_w13_rows_i8, dim=0)
+                bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows_i8, dim=0)
+                bundle[KEY_MOE_W13_R_SCALE] = torch.stack(routed_w13_scale_rows, dim=0)
+                bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0).squeeze(-1)
+            else:
+                bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows_i8, dim=0)
+                bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows_i8, dim=0)
+                bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows_i8, dim=0)
+                # Per-output-channel scale is [out] (1D) per expert — see
+                # _load_quantized_expert_projector_int8 (fp32_scale is [out]). The
+                # trailing out dim survives _transpose_routed_block, so stacking
+                # yields [NUM_MOE_LAYERS, EXPL, out] and matches the kernel/program
+                # signature [tp_size, N_MOE, EXPL, out]. The .squeeze(-1) is a
+                # defensive no-op (out = MOE_INTERMEDIATE/HIDDEN > 1) that also
+                # collapses the [out, 1] column form used by some W8A8 exporters;
+                # it would NOT repair a [1, out] row layout (that must be rejected
+                # by verify_bundle_shapes).
+                bundle[KEY_MOE_W_GATE_R_SCALE] = torch.stack(routed_gate_scale_rows, dim=0).squeeze(-1)
+                bundle[KEY_MOE_W_UP_R_SCALE] = torch.stack(routed_up_scale_rows, dim=0).squeeze(-1)
+                bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0).squeeze(-1)
         else:
-            bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
-            bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)
+            # BF16 dequant doubles the routed-expert bytes vs INT8 and holds the
+            # per-layer list alongside the stacked bundle; free each list right
+            # after stacking to bound the transient host-RAM peak (8 concurrent
+            # exporters otherwise trip the OOM killer).
+            if decode_native_moe:
+                bundle[KEY_MOE_W13_R] = torch.stack(routed_w13_rows, dim=0)
+                del routed_w13_rows
+            else:
+                bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
+                del routed_gate_rows
+                bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)
+                del routed_up_rows
             bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows, dim=0)
-        bundle[KEY_MOE_W_GATE_S] = torch.stack(share_gate_rows, dim=0)
-        bundle[KEY_MOE_W_UP_S] = torch.stack(share_up_rows, dim=0)
+            del routed_down_rows
+        share_gate_key = KEY_MOE_W_GATE_S_NK if decode_native_moe else KEY_MOE_W_GATE_S
+        share_up_key = KEY_MOE_W_UP_S_NK if decode_native_moe else KEY_MOE_W_UP_S
+        bundle[share_gate_key] = torch.stack(share_gate_rows, dim=0)
+        bundle[share_up_key] = torch.stack(share_up_rows, dim=0)
         bundle[KEY_MOE_W_DOWN_S] = torch.stack(share_down_rows, dim=0)
 
         # ── MTP layers (45..47). ────────────────────────────────────────
@@ -1044,6 +1344,10 @@ def load_step3p5_weights_for_rank(
 def verify_bundle_shapes(
     bundle: dict[str, "torch.Tensor"],
     tp_world_size: int = TP_WORLD_SIZE,
+    int8_routed: bool = False,
+    n_moe_layers: int | None = None,
+    *,
+    decode_native_moe: bool = False,
 ) -> None:
     """Assert every expected key is present with the right shape.
 
@@ -1051,7 +1355,10 @@ def verify_bundle_shapes(
     table in ``expected_shapes``. Does not check dtypes (the loader
     promotes/demotes via ``_to_bf16`` / ``_to_fp32`` already).
     """
-    expected = expected_shapes(tp_world_size)
+    expected = expected_shapes(
+        tp_world_size, int8_routed=int8_routed, n_moe_layers=n_moe_layers,
+        decode_native_moe=decode_native_moe,
+    )
     missing = sorted(set(expected) - set(bundle))
     extra = sorted(set(bundle) - set(expected))
     if missing:
@@ -1128,6 +1435,8 @@ COMPACT_DEFAULTS: dict[str, int] = {
 def build_compact_shape_table(
     tp_world_size: int = TP_WORLD_SIZE,
     overrides: dict[str, int] | None = None,
+    *,
+    decode_native_moe: bool = False,
 ) -> dict[str, tuple[int, ...]]:
     """Construct a shape table with scaled-down axes for smoke testing.
 
@@ -1164,7 +1473,7 @@ def build_compact_shape_table(
     H_LOCAL = H // tp_world_size
     V_LOCAL = V // tp_world_size
 
-    return {
+    shapes = {
         KEY_EMBED: (V, H),
         KEY_FINAL_NORM: (H,),
         KEY_INPUT_RMS: (L, H),
@@ -1192,6 +1501,9 @@ def build_compact_shape_table(
         KEY_MOE_W_GATE_R: (LM, EXPL, H, MI),
         KEY_MOE_W_UP_R: (LM, EXPL, H, MI),
         KEY_MOE_W_DOWN_R: (LM, EXPL, MI, H),
+        KEY_MOE_W_GATE_R_SCALE: (LM, EXPL, MI),
+        KEY_MOE_W_UP_R_SCALE: (LM, EXPL, MI),
+        KEY_MOE_W_DOWN_R_SCALE: (LM, EXPL, H),
         KEY_LM_HEAD: (V_LOCAL, H),
         KEY_MTP_ENORM: (MTP, H),
         KEY_MTP_HNORM: (MTP, H),
@@ -1211,6 +1523,26 @@ def build_compact_shape_table(
         KEY_MTP_DENSE_UP: (MTP, H, I_LOCAL),
         KEY_MTP_DENSE_DOWN: (MTP, I_LOCAL, H),
     }
+    if decode_native_moe:
+        # This table unconditionally carries the routed scale keys (the
+        # int8_routed=True shape contract), so the merged W13 projector uses
+        # its resident FRACTAL_NZ physical shape here.
+        shapes.pop(KEY_MOE_W_GATE_R)
+        shapes.pop(KEY_MOE_W_UP_R)
+        shapes[KEY_MOE_W13_R] = routed_int8_nz_shape(
+            (LM, EXPL, H, 2 * MI),
+        )
+        shapes.pop(KEY_MOE_W_GATE_R_SCALE)
+        shapes.pop(KEY_MOE_W_UP_R_SCALE)
+        shapes[KEY_MOE_W13_R_SCALE] = (LM, EXPL, 2 * MI)
+        shapes[KEY_MOE_W_DOWN_R] = routed_int8_nz_shape((LM, EXPL, MI, H))
+        shapes.pop(KEY_MOE_GATE_W)
+        shapes[KEY_MOE_GATE_W_NK] = (LM, EXP, H)
+        shapes.pop(KEY_MOE_W_GATE_S)
+        shapes.pop(KEY_MOE_W_UP_S)
+        shapes[KEY_MOE_W_GATE_S_NK] = (LM, I_LOCAL, H)
+        shapes[KEY_MOE_W_UP_S_NK] = (LM, I_LOCAL, H)
+    return shapes
 
 
 def build_synthetic_bundle(
@@ -1218,6 +1550,8 @@ def build_synthetic_bundle(
     tp_world_size: int = TP_WORLD_SIZE,
     seed: int = 0,
     shape_overrides: dict[str, tuple[int, ...]] | None = None,
+    *,
+    decode_native_moe: bool = False,
 ) -> dict[str, "torch.Tensor"]:
     """Build a per-rank bundle filled with deterministic random values.
 
@@ -1227,10 +1561,21 @@ def build_synthetic_bundle(
     """
     import torch  # noqa: PLC0415
 
-    shapes = shape_overrides or expected_shapes(tp_world_size)
+    shapes = shape_overrides or expected_shapes(
+        tp_world_size,
+        decode_native_moe=decode_native_moe,
+    )
     gen = torch.Generator().manual_seed(seed * 8191 + rank * 17)
     bundle: dict[str, torch.Tensor] = {}
-    fp32_keys = {KEY_MOE_GATE_W, KEY_MOE_ROUTER_BIAS}
+    fp32_keys = {
+        KEY_MOE_GATE_W,
+        KEY_MOE_GATE_W_NK,
+        KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_W_GATE_R_SCALE,
+        KEY_MOE_W_UP_R_SCALE,
+        KEY_MOE_W_DOWN_R_SCALE,
+        KEY_MOE_W13_R_SCALE,
+    }
     for key, shape in shapes.items():
         dtype = torch.float32 if key in fp32_keys else torch.bfloat16
         t = (torch.rand(*shape, generator=gen, dtype=torch.float32) - 0.5) * 0.1
@@ -1269,13 +1614,27 @@ __all__ = [
     "KEY_DENSE_UP",
     "KEY_DENSE_DOWN",
     "KEY_MOE_GATE_W",
+    "KEY_MOE_GATE_W_NK",
     "KEY_MOE_ROUTER_BIAS",
     "KEY_MOE_W_GATE_R",
     "KEY_MOE_W_UP_R",
     "KEY_MOE_W_DOWN_R",
+    "KEY_MOE_W13_R",
+    "KEY_MOE_W_GATE_R_SCALE",
+    "KEY_MOE_W_UP_R_SCALE",
+    "KEY_MOE_W_DOWN_R_SCALE",
+    "KEY_MOE_W13_R_SCALE",
     "KEY_MOE_W_GATE_S",
+    "KEY_MOE_W_GATE_S_NK",
     "KEY_MOE_W_UP_S",
+    "KEY_MOE_W_UP_S_NK",
     "KEY_MOE_W_DOWN_S",
+    "FRACTAL_NZ_M0",
+    "FRACTAL_NZ_N0_INT8",
+    "ROUTED_WEIGHT_LAYOUT_NZ",
+    "routed_int8_nz_shape",
+    "pack_int8_fractal_nz",
+    "unpack_int8_fractal_nz",
     "KEY_MTP_ENORM",
     "KEY_MTP_HNORM",
     "KEY_MTP_EH_PROJ",
@@ -1296,6 +1655,7 @@ __all__ = [
     # Entry points
     "expected_shapes",
     "load_step3p5_weights_for_rank",
+    "moe_slice_params",
     "verify_bundle_shapes",
     "build_synthetic_bundle",
     "build_compact_shape_table",

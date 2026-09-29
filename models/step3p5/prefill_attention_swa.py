@@ -60,6 +60,8 @@ Per-card weight bundle (host weight loader contract)
 
 from __future__ import annotations
 
+import os
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -70,11 +72,15 @@ from ._ops import (
 )
 from .config import (
     ATTN_SCALE,
+    BATCH,
     BLOCK_SIZE,
     BLOCK_TABLE_FLAT_DYN,
+    EPS,
     HEAD_DIM,
     HIDDEN,
+    HIDDEN_INV,
     HIDDEN_Q_SWA_LOCAL,
+    K_CHUNK,
     KV_CACHE_ROWS_DYN,
     KV_HEADS_LOCAL,
     KV_HIDDEN_LOCAL,
@@ -101,6 +107,12 @@ from .prefill_qkv_proj_rope import (
     _torch_prefill_qkv_oracle_impl,
 )
 
+PREFILL_TILE_COUNT = PREFILL_T // BATCH
+assert PREFILL_T % BATCH == 0, (
+    f"PREFILL_T={PREFILL_T} must be a multiple of BATCH={BATCH} "
+    "so the token-tiling loop can chunk into whole BATCH rows"
+)
+
 
 NUM_HEADS = NUM_HEADS_SWA_LOCAL          # 12
 HIDDEN_Q = HIDDEN_Q_SWA_LOCAL            # 1536
@@ -111,7 +123,18 @@ ROTARY_HALF = ROTARY_HALF_SWA            # 64
 ROTARY_DIM = ROTARY_HALF * 2             # 128
 WIN = SLIDING_WINDOW                     # 512
 
-LAYER_QHIDDEN_ROWS_DYN = pl.dynamic("LAYER_QHIDDEN_ROWS_DYN_PREFILL_SWA")
+# Per-layer dyn dim for the o_proj weight rows.
+# Staticized (was pl.dynamic("LAYER_QHIDDEN_ROWS_DYN_PREFILL_SWA")): the L3
+# DistributedWorker runtime cannot resolve named pl.dynamic dims (NameError,
+# same class as upstream pypto bugs #3/#4). The decode side works around this by
+# static-baking model-bound dyn dims; mirror it here. 33 = sliding-attention
+# layer count in LAYER_TYPES[:NUM_HIDDEN_LAYERS] (45 hidden layers − 12 full);
+# the wo bundle stacks all swa layers at HIDDEN_Q_SWA_LOCAL rows each.
+LAYER_QHIDDEN_ROWS_DYN = 33 * HIDDEN_Q_SWA_LOCAL
+
+# Dump switch: default off (production); precision test flow sets
+# PYPTO_STEP3P5_DUMP=1 to statically enable the dump assembles.
+_DUMP_ENABLED = os.environ.get("PYPTO_STEP3P5_DUMP", "0") != "0"
 
 
 assert HIDDEN_Q % OUT_PROJ_K_CHUNK == 0
@@ -148,11 +171,30 @@ def attention_swa_prefill(
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16],
+    gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
     positions: pl.Tensor[[PREFILL_T], pl.INT32],
     resid1_out: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    v_dump: pl.Tensor[[PREFILL_T, KV_HIDDEN_LOCAL], pl.BF16],
+    attn_out_dump: pl.Tensor[[PREFILL_T, HIDDEN_Q_SWA_LOCAL], pl.BF16],
+    attn_out_gated_dump: pl.Tensor[[PREFILL_T, HIDDEN_Q_SWA_LOCAL], pl.BF16],
+    o_proj_dump: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
+    o_proj_reduced_dump: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
+    scores_dump: pl.Tensor[[PREFILL_T * 16, 128], pl.FP32],
+    input_norm_dump: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
+    q_proj_dump: pl.Tensor[[PREFILL_T, HIDDEN_Q_SWA_LOCAL], pl.FP32],
+    k_proj_dump: pl.Tensor[[PREFILL_T, KV_HIDDEN_LOCAL], pl.FP32],
+    v_proj_dump: pl.Tensor[[PREFILL_T, KV_HIDDEN_LOCAL], pl.FP32],
+    v_tile_dump: pl.Tensor[[PREFILL_T, KV_HIDDEN_LOCAL], pl.BF16],
+    q_norm_dump: pl.Tensor[[PREFILL_T, HIDDEN_Q_SWA_LOCAL], pl.FP32],
+    k_norm_dump: pl.Tensor[[PREFILL_T, KV_HIDDEN_LOCAL], pl.FP32],
+    gate_logits_dump: pl.Tensor[
+        [PREFILL_T, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16
+    ],
+    attn_delta_dump: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    attn_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
-        [PREFILL_T, HIDDEN // TP_WORLD_SIZE], pl.BF16
+        [PREFILL_T, HIDDEN], pl.BF16
     ],
     signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -168,10 +210,10 @@ def attention_swa_prefill(
     ``PrefillLayerMoE.chip_orch``. Literals make every shape /
     arithmetic argument an unambiguous compile-time integer.
     """
-    layer_qhidden_base = layer_idx * HIDDEN_Q_SWA_LOCAL
+    layer_qhidden_base = attn_layer_idx * HIDDEN_Q_SWA_LOCAL
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
-    layer_cache_base = layer_idx * layer_cache_rows
+    layer_cache_base = norm_layer_idx * layer_cache_rows
 
     # ── Scope 1 — inlined prefill QKV+RoPE body (swa, Phase X.9). ────────
     # SWA variant: NUM_HEADS=12, HIDDEN_Q=1536, Q_PER_KV=12, KV_HEADS=1,
@@ -186,7 +228,7 @@ def attention_swa_prefill(
 
     qkv_d_blocks = HIDDEN // 256
     qkv_q_blocks = HIDDEN_Q_SWA_LOCAL // 128
-    layer_hidden_base = layer_idx * HIDDEN
+    layer_hidden_base = attn_layer_idx * HIDDEN
 
     # ── Stage 1.a — replicated zero-centred input RMSNorm. ───────────
     for tg_idx in pl.spmd(
@@ -228,7 +270,7 @@ def attention_swa_prefill(
             )
             gamma = pl.slice(
                 input_rms_weight,
-                [1, 256], [layer_idx, k0],
+                [1, 256], [norm_layer_idx, k0],
             )
             scaled_rms = pl.row_expand_mul(chunk, inv_rms)
             normed_rms = pl.col_expand_mul(scaled_rms, pl.add(gamma, 1.0))
@@ -237,6 +279,10 @@ def attention_swa_prefill(
                 pl.cast(normed_rms, target_type=pl.BF16),
                 [tg, k0],
             )
+
+    # Module dump 1: input_norm (post-input RMSNorm hidden, replicated).
+    if _DUMP_ENABLED:
+        input_norm_dump = pl.assemble(input_norm_dump, normed_tile, [0, 0])
 
     # ── Stage 1.b — Q projection (per-rank heads). ───────────────────
     q_proj = pl.create_tensor(
@@ -270,6 +316,10 @@ def attention_swa_prefill(
             q_acc = pl.matmul_acc(q_acc, q_a, q_w)
         q_proj = pl.assemble(q_proj, q_acc, [tg, q_o0])
 
+    # Module dump 2: qkv_proj.q (swa = 1536 cols).
+    if _DUMP_ENABLED:
+        q_proj_dump = pl.assemble(q_proj_dump, q_proj, [0, 0])
+
     # ── Stage 1.c — K projection. ────────────────────────────────────
     k_proj = pl.create_tensor(
         [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
@@ -297,6 +347,10 @@ def attention_swa_prefill(
             )
             k_acc = pl.matmul_acc(k_acc, k_a, k_w)
         k_proj = pl.assemble(k_proj, k_acc, [tg, 0])
+
+    # Module dump 2: qkv_proj.k (single rank-local KV head).
+    if _DUMP_ENABLED:
+        k_proj_dump = pl.assemble(k_proj_dump, k_proj, [0, 0])
 
     # ── Stage 1.d — V projection. ────────────────────────────────────
     v_proj = pl.create_tensor(
@@ -326,13 +380,17 @@ def attention_swa_prefill(
             v_acc = pl.matmul_acc(v_acc, v_a, v_w)
         v_proj = pl.assemble(v_proj, v_acc, [tg, 0])
 
-    # ── Stage 1.e — head-wise gate matmul (on un-normed input). ──────
+    # Module dump 2: qkv_proj.v (single rank-local KV head).
+    if _DUMP_ENABLED:
+        v_proj_dump = pl.assemble(v_proj_dump, v_proj, [0, 0])
+
+    # ── Stage 1.e — head-wise gate matmul (on normed input). ──────
     for tg_idx in pl.spmd(
         PREFILL_T // TOK_TILE, name_hint="prefill_swa_gate_proj",
     ):
         tg = tg_idx * TOK_TILE
         g_a0 = pl.slice(
-            current_hidden, [TOK_TILE, 256], [tg, 0],
+            normed_tile, [TOK_TILE, 256], [tg, 0],
         )
         g_w0 = pl.slice(
             w_g, [256, NUM_HEADS_SWA_LOCAL_PAD],
@@ -342,7 +400,7 @@ def attention_swa_prefill(
         for kb in pl.range(1, qkv_d_blocks):
             k0 = kb * 256
             g_a = pl.slice(
-                current_hidden,
+                normed_tile,
                 [TOK_TILE, 256], [tg, k0],
             )
             g_w = pl.slice(
@@ -352,9 +410,16 @@ def attention_swa_prefill(
             g_acc = pl.matmul_acc(g_acc, g_a, g_w)
         gate_logits = pl.assemble(
             gate_logits,
-            pl.set_validshape(g_acc, TOK_TILE, NUM_HEADS_SWA_LOCAL),
+            pl.set_validshape(g_acc, TOK_TILE, NUM_HEADS_SWA_LOCAL_PAD),
             [tg, 0],
         )
+        # Module dump 4: attn_gate_logits.gate (FP32 -> BF16, padded to 16).
+        if _DUMP_ENABLED:
+            gate_logits_dump = pl.assemble(
+                gate_logits_dump,
+                pl.cast(g_acc, target_type=pl.BF16, mode="rint"),
+                [tg, 0],
+            )
 
     # ── Stage 1.f — per-head zero-centred q_norm / k_norm. ───────────
     q_proj_norm = pl.create_tensor(
@@ -363,41 +428,57 @@ def attention_swa_prefill(
     k_proj_norm = pl.create_tensor(
         [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
     )
-    for qkn_idx in pl.spmd(
-        (PREFILL_T // TOK_TILE) * 1,
-        name_hint="prefill_swa_qk_norm_zc",
+    # qk_norm folds heads into the row dim ([T_TILE*H, HEAD_DIM]), so its Vec
+    # footprint scales with heads. SWA's 12 heads need both a smaller token
+    # tile (TOK_TILE//4 keeps FP32 32-byte col alignment: rows*4 % 32 == 0)
+    # AND a head split (2 chunks of 6) to stay under the 188416-byte Vec limit.
+    QK_NORM_T_TILE = TOK_TILE // 4
+    Q_NORM_H_CHUNKS = 2
+    Q_HEADS_PER_CHUNK = 6
+    for qn_idx in pl.spmd(
+        (PREFILL_T // QK_NORM_T_TILE) * Q_NORM_H_CHUNKS,
+        name_hint="prefill_swa_q_norm_zc",
     ):
-        tg_idx2 = qkn_idx // 1
-        kh = qkn_idx % 1
-        tg = tg_idx2 * TOK_TILE
-        q_col = kh * 12 * HEAD_DIM
+        tg_idx = qn_idx // Q_NORM_H_CHUNKS
+        khc = qn_idx % Q_NORM_H_CHUNKS
+        tg = tg_idx * QK_NORM_T_TILE
+        q_col = khc * Q_HEADS_PER_CHUNK * HEAD_DIM
         q_chunk = pl.reshape(
             pl.slice(
-                q_proj, [TOK_TILE, 12 * HEAD_DIM], [tg, q_col],
+                q_proj,
+                [QK_NORM_T_TILE, Q_HEADS_PER_CHUNK * HEAD_DIM], [tg, q_col],
             ),
-            [TOK_TILE * 12, HEAD_DIM],
+            [QK_NORM_T_TILE * Q_HEADS_PER_CHUNK, HEAD_DIM],
         )
-        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
-        # Phase X.7: per_head_qk_norm body inlined.
+        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
+        # per_head_qk_norm helper deleted (Problem 19); logic inlined below.
         q_sq = pl.row_sum(pl.mul(q_chunk, q_chunk))
-        q_inv = pl.rsqrt(pl.add(pl.mul(q_sq, 0.0078125), EPS))
+        q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_sq, 0.0078125), EPS)))
         q_scaled = pl.row_expand_mul(q_chunk, q_inv)
         q_normed = pl.col_expand_mul(q_scaled, pl.add(q_gamma, 1.0))
         q_normed_flat = pl.reshape(
-            q_normed, [TOK_TILE, 12 * HEAD_DIM],
+            q_normed, [QK_NORM_T_TILE, Q_HEADS_PER_CHUNK * HEAD_DIM],
         )
         q_proj_norm = pl.assemble(
             q_proj_norm, q_normed_flat, [tg, q_col],
         )
 
-        k_col = kh * HEAD_DIM
-        k_chunk = pl.slice(k_proj, [TOK_TILE, HEAD_DIM], [tg, k_col])
-        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+    for kn_idx in pl.spmd(
+        PREFILL_T // TOK_TILE, name_hint="prefill_swa_k_norm_zc",
+    ):
+        tg = kn_idx * TOK_TILE
+        k_chunk = pl.slice(k_proj, [TOK_TILE, HEAD_DIM], [tg, 0])
+        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         k_sq = pl.row_sum(pl.mul(k_chunk, k_chunk))
-        k_inv = pl.rsqrt(pl.add(pl.mul(k_sq, 0.0078125), EPS))
+        k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_sq, 0.0078125), EPS)))
         k_scaled = pl.row_expand_mul(k_chunk, k_inv)
         k_normed = pl.col_expand_mul(k_scaled, pl.add(k_gamma, 1.0))
-        k_proj_norm = pl.assemble(k_proj_norm, k_normed, [tg, k_col])
+        k_proj_norm = pl.assemble(k_proj_norm, k_normed, [tg, 0])
+
+    # Module dump 3: qk_norm.q / qk_norm.k (pre-RoPE; swa q = 1536 cols).
+    if _DUMP_ENABLED:
+        q_norm_dump = pl.assemble(q_norm_dump, q_proj_norm, [0, 0])
+        k_norm_dump = pl.assemble(k_norm_dump, k_proj_norm, [0, 0])
 
     # ── Stage 1.g — full RoPE on Q and K (SWA: rotary_dim = HEAD_DIM). ─
     for t in pl.parallel(PREFILL_T):
@@ -498,17 +579,24 @@ def attention_swa_prefill(
                         [t, h_col + 64],
                     )
 
+    # Module dump: k_rot (post-RoPE K) — matches golden kv_cache.k.
+    if _DUMP_ENABLED:
+        v_dump = pl.assemble(v_dump, k_rot, [0, 0])
+        v_tile_dump = pl.assemble(v_tile_dump, v_tile, [0, 0])
+
     # ── Scope 2.a — write KV cache. ──────────────────────────────────────
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_kv_write"):
         for t in pl.range(PREFILL_T):
-            slot = pl.tensor.read(slot_mapping, [t])
-            slot_block = slot // 128
-            slot_offset = slot - slot_block * 128
-            for kh in pl.range(1):
+            # Paged write: logical block -> physical block via block_table,
+            # matching Scope 2.b's read side (block_table[bt_idx] * BLOCK_SIZE).
+            block_idx = t // BLOCK_SIZE
+            block = pl.tensor.read(block_table, [block_idx])
+            offset = t - block_idx * BLOCK_SIZE
+            for kh in pl.range(KV_HEADS_LOCAL):
                 cache_row = (
                     layer_cache_base
-                    + (slot_block * 1 + kh) * 128
-                    + slot_offset
+                    + (block * KV_HEADS_LOCAL + kh) * BLOCK_SIZE
+                    + offset
                 )
                 k_row = pl.slice(k_rot, [1, HEAD_DIM], [t, kh * HEAD_DIM])
                 v_row = pl.slice(v_tile, [1, HEAD_DIM], [t, kh * HEAD_DIM])
@@ -518,26 +606,56 @@ def attention_swa_prefill(
     # ── Scope 2.b — causal + sliding-window flash attention. ─────────────
     attn_out = pl.create_tensor([PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
     bt_stride = pl.cast(32, pl.INDEX)
-    # Pad each token's 12 Q-heads to Q_HEAD_PAD_SWA=24 so the matmul
-    # satisfies the Cube fractal minimum M=16. The 12 padding rows are
-    # zero-filled; set_validshape(Q_HEAD_PAD_SWA // 2 = 12) masks them.
+    # Pad each token's 12 Q-heads to 16 (next multiple of the Cube fractal
+    # innerRows=16). The 4 padding rows are zero-filled; set_validshape(12)
+    # masks them.
     q_rot_flat = pl.reshape(q_rot, [PREFILL_T * 12, HEAD_DIM])
     q_rot_padded = pl.create_tensor(
-        [PREFILL_T * 24, HEAD_DIM], dtype=pl.BF16,
+        [PREFILL_T * 16, HEAD_DIM], dtype=pl.BF16,
     )
     for tp in pl.parallel(PREFILL_T):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_q_head_pad"):
             q_rot_padded = pl.assemble(
                 q_rot_padded,
                 pl.slice(q_rot_flat, [12, HEAD_DIM], [tp * 12, 0]),
-                [tp * 24, 0],
+                [tp * 16, 0],
             )
             q_rot_padded = pl.assemble(
                 q_rot_padded,
-                pl.full([12, HEAD_DIM], dtype=pl.BF16, value=0.0),
-                [tp * 24 + 12, 0],
+                pl.full([4, HEAD_DIM], dtype=pl.BF16, value=0.0),
+                [tp * 16 + 12, 0],
             )
 
+    # The prior single-loop form carried the online-softmax running
+    # max/sum/output through GM read-modify-write buffers (mi_buf/li_buf/
+    # oi_buf) across the dynamically-dispatched QK/PV kernels. For tokens whose
+    # sliding window spans >= 2 KV blocks that cross-kernel recurrence raced
+    # (run-to-run drift pinned in Step 4; same root cause as full attention).
+    # Split into a pure block-wise map (Stage 1, disjoint per-(token, block)
+    # scratch) + an intra-kernel recurrence (Stage 2), mirroring the fixed
+    # prefill_attention_full pipeline. The sliding window is 512 tokens, so a
+    # window spans at most ceil(512/128)+1 = 5 KV blocks (the window start may
+    # fall mid-block, hence the +1).
+    MAX_CTX_BLOCKS = 5
+
+    # Stage 1 scratch — one disjoint slot per (token, KV block). mi/li keep all
+    # 16 padded head rows: SWA's 12 real heads are NOT a 32-byte-aligned FP32
+    # row width (12*4 = 48 bytes), so the zero-pad rows must be carried through
+    # the recurrence and stripped only at the final normalize. Stored as [1, 16]
+    # rows (the [16,1] column shape cannot be materialized inside InCore); exp
+    # keeps all 16 rows for the SV cube matmul.
+    all_cur_mi = pl.create_tensor(
+        [PREFILL_T * MAX_CTX_BLOCKS, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.FP32,
+    )
+    all_cur_li = pl.create_tensor(
+        [PREFILL_T * MAX_CTX_BLOCKS, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.FP32,
+    )
+    all_exp = pl.create_tensor(
+        [PREFILL_T * MAX_CTX_BLOCKS * NUM_HEADS_SWA_LOCAL_PAD, HEAD_DIM],
+        dtype=pl.BF16,
+    )
+
+    # Stage 1 — QK matmul + per-block softmax (pure map, disjoint writes).
     for t in pl.parallel(PREFILL_T):
         pos = pl.cast(pl.tensor.read(positions, [t]), pl.INDEX)
         ctx_len_full = pos + 1
@@ -547,158 +665,328 @@ def attention_swa_prefill(
         )
         start_block = start_pos // 128
         end_block = (ctx_len_full + 128 - 1) // 128
+        ctx_blocks = end_block - start_block
         bt_base = pl.cast(0, pl.INDEX) * bt_stride
-
-        # GM-level flash accumulators — outside InCore to avoid the Cube
-        # fractal-tile reshape error on [24,1] FP32 shapes.
-        mi_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-        li_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-        oi_buf = pl.create_tensor([24, HEAD_DIM], dtype=pl.FP32)
-        # Per-KV-block intermediates; reused (overwritten) each iteration.
-        exp_buf = pl.create_tensor([24, 128], dtype=pl.BF16)
-        alpha_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-        beta_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-
-        # Initialise running accumulators (mi=-inf, li=0, oi=0).
-        # pl.full([24, 1], FP32) fails pto.alloc_tile: cols*sizeof = 1*4 = 4 bytes,
-        # not 32-byte aligned.  Use pl.full([24, HEAD_DIM], FP32) (128*4=512 bytes,
-        # aligned) and derive the [24,1] init via row_max (reduction, no alloc_tile).
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_fa_init"):
-            mi_buf = pl.assemble(
-                mi_buf,
-                pl.row_max(pl.full([24, HEAD_DIM], dtype=pl.FP32, value=-3.0e38)),
-                [0, 0],
+        for sb in pl.range(ctx_blocks):
+            actual_sb = sb + start_block
+            s0 = actual_sb * 128
+            lo = pl.max(start_pos, s0)
+            hi = pl.min(s0 + 128, ctx_len_full)
+            bt_idx = bt_base + actual_sb
+            pbid = pl.cast(
+                pl.tensor.read(block_table, [bt_idx]), pl.INDEX,
             )
-            li_buf = pl.assemble(
-                li_buf,
-                pl.row_max(pl.full([24, HEAD_DIM], dtype=pl.FP32, value=0.0)),
-                [0, 0],
-            )
-            oi_buf = pl.assemble(
-                oi_buf,
-                pl.full([24, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                [0, 0],
-            )
-
-        for kh in pl.range(1):
-            q_base = kh * 12
-            # KV loop at orchestration level — separates the dynamic loop and
-            # the two matmuls (q@k, exp@v) into distinct InCore scopes.
-            for sb in pl.range(start_block, end_block):
-                s0 = sb * 128
-                lo = pl.max(start_pos, s0)
-                hi = pl.min(s0 + 128, ctx_len_full)
-                valid_len = hi - lo
-                bt_idx = bt_base + sb
-                pbid = pl.cast(
-                    pl.tensor.read(block_table, [bt_idx]), pl.INDEX,
-                )
-                cache_row0 = (
-                    layer_cache_base
-                    + (pbid * 1 + kh) * 128
-                )
-                k_tile = k_cache[
-                    cache_row0 : cache_row0 + 128, :
-                ]
-                v_tile_sb = v_cache[
-                    cache_row0 : cache_row0 + 128, :
-                ]
-
-                # Block 1 — QK matmul + online-softmax step.
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_swa_fa_qk",
-                ):
-                    # Padded 24-head block for token t: real [0:12], zero [12:24].
-                    q_block = q_rot_padded[
-                        t * 24 : t * 24 + 24, 0 : HEAD_DIM,
-                    ]
-                    raw_scores = pl.matmul(
-                        q_block, k_tile, b_trans=True, out_dtype=pl.FP32,
-                    )
-                    scores_scaled = pl.mul(raw_scores, 0.08838834764831845)
-                    scores_valid = pl.set_validshape(
-                        scores_scaled, 12, valid_len,
-                    )
-                    scores = pl.fillpad(
-                        scores_valid, pad_value=pl.PadValue.min,
-                    )
-                    cur_mi = pl.row_max(scores)
-                    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                    exp_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                    cur_li = pl.row_sum(
-                        pl.cast(exp_bf16, target_type=pl.FP32)
-                    )
-                    # Load running mi/li from GM (MTE load, no fractal constraint).
-                    mi_cur = mi_buf[0:24, 0:1]
-                    li_cur = li_buf[0:24, 0:1]
-                    mi_new = pl.maximum(mi_cur, cur_mi)
-                    alpha = pl.exp(pl.sub(mi_cur, mi_new))
-                    beta = pl.exp(pl.sub(cur_mi, mi_new))
-                    li_new = pl.add(
-                        pl.mul(alpha, li_cur), pl.mul(beta, cur_li)
-                    )
-                    mi_buf = pl.assemble(mi_buf, mi_new, [0, 0])
-                    li_buf = pl.assemble(li_buf, li_new, [0, 0])
-                    exp_buf = pl.assemble(exp_buf, exp_bf16, [0, 0])
-                    alpha_buf = pl.assemble(alpha_buf, alpha, [0, 0])
-                    beta_buf = pl.assemble(beta_buf, beta, [0, 0])
-
-                # Block 2 — PV matmul + accumulate output.
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_swa_fa_pv",
-                ):
-                    exp_b2 = exp_buf[0:24, 0:128]
-                    oi_tmp = pl.matmul(exp_b2, v_tile_sb, out_dtype=pl.FP32)
-                    oi_cur = oi_buf[0:24, 0:HEAD_DIM]
-                    alpha_b2 = alpha_buf[0:24, 0:1]
-                    beta_b2 = beta_buf[0:24, 0:1]
-                    oi_new = pl.add(
-                        pl.row_expand_mul(oi_cur, alpha_b2),
-                        pl.row_expand_mul(oi_tmp, beta_b2),
-                    )
-                    oi_buf = pl.assemble(oi_buf, oi_new, [0, 0])
-
-            # Final normalisation — divide accumulated oi by li.
+            cache_row0 = layer_cache_base + pbid * 128
             with pl.at(
                 level=pl.Level.CORE_GROUP,
-                name_hint="prefill_swa_fa_norm",
+                name_hint="prefill_swa_fa_qk",
             ):
-                oi_final = oi_buf[0:24, 0:HEAD_DIM]
-                li_final = li_buf[0:24, 0:1]
-                ctx = pl.row_expand_div(oi_final, li_final)
-                # Slice the 12 real head rows (rows 12-23 are zero-pad).
-                ctx_valid = ctx[0:12, 0:HEAD_DIM]
-                ctx_flat = pl.cast(
-                    pl.reshape(ctx_valid, [1, 12 * HEAD_DIM]),
-                    target_type=pl.BF16,
+                q_block = q_rot_padded[
+                    t * 16 : t * 16 + 16, 0 : HEAD_DIM,
+                ]
+                k_tile = pl.slice(
+                    k_cache, [128, HEAD_DIM], [cache_row0, 0],
                 )
-                attn_out = pl.assemble(
-                    attn_out, ctx_flat, [t, q_base * HEAD_DIM],
+                raw_scores = pl.matmul(
+                    q_block, k_tile, b_trans=True, out_dtype=pl.FP32,
+                )
+                scores_scaled = pl.mul(raw_scores, 0.08838834764831845)
+                # The sliding window may start mid-block (start_pos > s0 for
+                # tokens past the window), so the valid columns within this KV
+                # block are [lo - s0, hi - s0), not [0, valid_len). Mask only
+                # the pad-head rows (12..16) via valid_shape + fillpad, then
+                # mask the out-of-window columns with a per-column bias
+                # (mirroring the decode-side SWA softmax). The bias is computed
+                # unconditionally: when the block is fully in-window
+                # (valid_len == 128) rel_lo=0 / rel_hi=128 give valid_mask=1,
+                # so invalid_bias is 0 and the add is a no-op. This avoids an
+                # if/else phi on `scores` whose col_major store layout (for the
+                # scores_dump assemble) would otherwise break trowmax.
+                scores_clipped = pl.slice(
+                    scores_scaled, [16, 128], [0, 0],
+                    valid_shape=[12, 128],
+                )
+                scores = pl.fillpad(
+                    scores_clipped, pad_value=pl.PadValue.min,
+                )
+                score_cols = pl.arange(0, [1, 128], dtype=pl.INT32)
+                zero_i32 = pl.const(0, pl.INT32)
+                one_i32 = pl.const(1, pl.INT32)
+                rel_lo = lo - s0
+                rel_hi = hi - s0
+                valid_from_i32 = pl.minimum(
+                    pl.maximum(
+                        pl.add(
+                            pl.sub(
+                                score_cols,
+                                pl.cast(rel_lo, pl.INT32),
+                            ),
+                            one_i32,
+                        ),
+                        zero_i32,
+                    ),
+                    one_i32,
+                )
+                valid_to_i32 = pl.minimum(
+                    pl.maximum(
+                        pl.neg(
+                            pl.sub(
+                                score_cols,
+                                pl.cast(rel_hi, pl.INT32),
+                            ),
+                        ),
+                        zero_i32,
+                    ),
+                    one_i32,
+                )
+                valid_mask = pl.cast(
+                    pl.mul(valid_from_i32, valid_to_i32),
+                    target_type=pl.FP32,
+                )
+                invalid_bias = pl.mul(
+                    pl.sub(valid_mask, 1.0),
+                    1.0e20,
+                )
+                scores = pl.col_expand_add(scores, invalid_bias)
+                if _DUMP_ENABLED:
+                    scores_dump = pl.assemble(
+                        scores_dump, scores, [t * 16, 0],
+                    )
+                cur_mi = pl.row_max(scores)
+                exp_scores = pl.exp(
+                    pl.row_expand_sub(scores, cur_mi)
+                )
+                exp_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                cur_li = pl.row_sum(
+                    pl.cast(exp_bf16, target_type=pl.FP32)
+                )
+                scratch_row = t * MAX_CTX_BLOCKS + sb
+                all_cur_mi = pl.assemble(
+                    all_cur_mi,
+                    pl.reshape(cur_mi, [1, NUM_HEADS_SWA_LOCAL_PAD]),
+                    [scratch_row, 0],
+                )
+                all_cur_li = pl.assemble(
+                    all_cur_li,
+                    pl.reshape(cur_li, [1, NUM_HEADS_SWA_LOCAL_PAD]),
+                    [scratch_row, 0],
+                )
+                exp_base = scratch_row * NUM_HEADS_SWA_LOCAL_PAD
+                all_exp = pl.assemble(
+                    all_exp, exp_bf16, [exp_base, 0],
                 )
 
-    # ── Scope 2.5 — head-wise gate. ──────────────────────────────────────
-    attn_out_gated = pl.create_tensor([PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
-    for hg_idx in pl.spmd(
-        (PREFILL_T // TOK_TILE) * NUM_HEADS_SWA_LOCAL,
-        name_hint="prefill_swa_head_gate",
+    # Stage 2 — online recurrence + normalize, intra-kernel per token.
+    online_oi = pl.create_tensor(
+        [PREFILL_T * NUM_HEADS_SWA_LOCAL_PAD, HEAD_DIM], dtype=pl.FP32,
+    )
+    online_ml = pl.create_tensor(
+        [PREFILL_T, 2 * NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.FP32,
+    )
+    for t in pl.spmd(PREFILL_T, name_hint="prefill_swa_fa_online"):
+        pos = pl.cast(pl.tensor.read(positions, [t]), pl.INDEX)
+        ctx_len_full = pos + 1
+        start_pos = pl.max(
+            pl.cast(0, pl.INDEX),
+            pl.cast(ctx_len_full - 512, pl.INDEX),
+        )
+        start_block = start_pos // 128
+        end_block = (ctx_len_full + 128 - 1) // 128
+        ctx_blocks = end_block - start_block
+        bt_base = pl.cast(0, pl.INDEX) * bt_stride
+        for sb in pl.range(ctx_blocks):
+            actual_sb = sb + start_block
+            bt_idx = bt_base + actual_sb
+            pbid = pl.cast(
+                pl.tensor.read(block_table, [bt_idx]), pl.INDEX,
+            )
+            cache_row0 = layer_cache_base + pbid * 128
+            scratch_row = t * MAX_CTX_BLOCKS + sb
+            exp_base = scratch_row * NUM_HEADS_SWA_LOCAL_PAD
+            exp_tile = pl.slice(
+                all_exp,
+                [NUM_HEADS_SWA_LOCAL_PAD, HEAD_DIM],
+                [exp_base, 0],
+            )
+            v_tile_sb = pl.slice(
+                v_cache, [128, HEAD_DIM], [cache_row0, 0],
+            )
+            oi_tmp = pl.matmul(exp_tile, v_tile_sb, out_dtype=pl.FP32)
+            cur_mi_row = pl.slice(
+                all_cur_mi, [1, NUM_HEADS_SWA_LOCAL_PAD], [scratch_row, 0],
+            )
+            cur_li_row = pl.slice(
+                all_cur_li, [1, NUM_HEADS_SWA_LOCAL_PAD], [scratch_row, 0],
+            )
+            if sb == 0:
+                online_oi = pl.assemble(
+                    online_oi, oi_tmp,
+                    [t * NUM_HEADS_SWA_LOCAL_PAD, 0],
+                )
+                online_ml = pl.assemble(
+                    online_ml,
+                    pl.concat(cur_mi_row, cur_li_row),
+                    [t, 0],
+                )
+            else:
+                acc_oi = pl.slice(
+                    online_oi,
+                    [NUM_HEADS_SWA_LOCAL_PAD, HEAD_DIM],
+                    [t * NUM_HEADS_SWA_LOCAL_PAD, 0],
+                )
+                acc_mi_row = pl.slice(
+                    online_ml, [1, NUM_HEADS_SWA_LOCAL_PAD], [t, 0],
+                )
+                acc_li_row = pl.slice(
+                    online_ml,
+                    [1, NUM_HEADS_SWA_LOCAL_PAD],
+                    [t, NUM_HEADS_SWA_LOCAL_PAD],
+                )
+                mi_new = pl.maximum(acc_mi_row, cur_mi_row)
+                alpha_row = pl.exp(pl.sub(acc_mi_row, mi_new))
+                beta_row = pl.exp(pl.sub(cur_mi_row, mi_new))
+                li_new = pl.add(
+                    pl.mul(alpha_row, acc_li_row),
+                    pl.mul(beta_row, cur_li_row),
+                )
+                alpha = pl.reshape(
+                    alpha_row, [NUM_HEADS_SWA_LOCAL_PAD, 1],
+                )
+                beta = pl.reshape(
+                    beta_row, [NUM_HEADS_SWA_LOCAL_PAD, 1],
+                )
+                oi_new = pl.add(
+                    pl.row_expand_mul(acc_oi, alpha),
+                    pl.row_expand_mul(oi_tmp, beta),
+                )
+                online_oi = pl.assemble(
+                    online_oi, oi_new,
+                    [t * NUM_HEADS_SWA_LOCAL_PAD, 0],
+                )
+                online_ml = pl.assemble(
+                    online_ml,
+                    pl.concat(mi_new, li_new),
+                    [t, 0],
+                )
+
+        # Divide on the aligned [16,...] padded shapes, then strip the 4
+        # zero-pad head rows only at the final reshape (12 real heads are not
+        # a 32-byte-aligned FP32 row width, so the recurrence must keep 16).
+        oi_final = pl.slice(
+            online_oi,
+            [NUM_HEADS_SWA_LOCAL_PAD, HEAD_DIM],
+            [t * NUM_HEADS_SWA_LOCAL_PAD, 0],
+        )
+        li_final_row = pl.slice(
+            online_ml,
+            [1, NUM_HEADS_SWA_LOCAL_PAD],
+            [t, NUM_HEADS_SWA_LOCAL_PAD],
+        )
+        li_final_col = pl.reshape(
+            li_final_row, [NUM_HEADS_SWA_LOCAL_PAD, 1],
+        )
+        ctx = pl.row_expand_div(oi_final, li_final_col)
+        ctx_valid = pl.slice(
+            ctx, [NUM_HEADS_SWA_LOCAL, HEAD_DIM], [0, 0],
+        )
+        ctx_flat = pl.cast(
+            pl.reshape(
+                ctx_valid, [1, NUM_HEADS_SWA_LOCAL * HEAD_DIM],
+            ),
+            target_type=pl.BF16,
+        )
+        attn_out = pl.assemble(attn_out, ctx_flat, [t, 0])
+
+    # NaN diag: post-flash-attention output (pre-gate).
+    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_attn_out_dump"):
+        # for kb in pl.range(HIDDEN_Q_SWA_LOCAL // K_CHUNK):
+            # k0 = kb * K_CHUNK
+            # attn_out_dump = pl.assemble(
+                # attn_out_dump,
+                # pl.slice(attn_out, [PREFILL_T, K_CHUNK], [0, k0]),
+                # [0, k0],
+            # )
+
+    # ── Scope 2.5 — head-wise sigmoid gate via block-diagonal gate_r expand. ──
+    # gate_logits is computed post-norm in Stage 1.e (normed_tile @ w_g),
+    # matching vLLM's g_proj(hidden_states). The per-head score is expanded
+    # across HEAD_DIM via the constant block-diagonal R (``gate_r``), then
+    # attn_out is multiplied element-wise. This mirrors decode's
+    # head_wise_gate_apply (gate_r fix) and avoids the [TOK_TILE,1] column
+    # slice whose TLOAD hits the pto-isa ND2ND [N,1] VEC layout wall.
+    gate_score_t = pl.create_tensor(
+        [PREFILL_T, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.BF16,
+    )
+    for gs_idx in pl.spmd(
+        PREFILL_T // TOK_TILE, name_hint="prefill_swa_gate_sigmoid",
     ):
-        tg_idx = hg_idx // NUM_HEADS_SWA_LOCAL
-        h = hg_idx % NUM_HEADS_SWA_LOCAL
-        tg = tg_idx * TOK_TILE
-        h_col = h * HEAD_DIM
-        head_slab = pl.slice(
-            attn_out, [TOK_TILE, HEAD_DIM], [tg, h_col],
+        tg = gs_idx * TOK_TILE
+        gs_logits = pl.slice(
+            gate_logits, [TOK_TILE, NUM_HEADS_SWA_LOCAL_PAD], [tg, 0],
         )
-        gate_col = pl.slice(gate_logits, [TOK_TILE, 1], [tg, h])
-        # Phase X.7: head_wise_gate_apply body inlined.
-        hg_gate = pl.recip(pl.add(pl.exp(pl.neg(gate_col)), 1.0))
-        hg_gated_fp32 = pl.row_expand_mul(
-            pl.cast(head_slab, target_type=pl.FP32), hg_gate,
+        gs_score = pl.recip(pl.add(pl.exp(pl.neg(gs_logits)), 1.0))
+        gate_score_t = pl.assemble(
+            gate_score_t, pl.cast(gs_score, target_type=pl.BF16), [tg, 0],
         )
-        gated = pl.cast(hg_gated_fp32, target_type=pl.BF16)
-        attn_out_gated = pl.assemble(attn_out_gated, gated, [tg, h_col])
+
+    gate_exp = pl.create_tensor(
+        [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16,
+    )
+    gate_exp_chunks = HIDDEN_Q_SWA_LOCAL // K_CHUNK
+    # The [TOK_TILE, K_CHUNK] FP32 matmul accumulator would overflow Vec
+    # (same class as o_proj); use a half-size token tile like OUT_PROJ_T_TILE.
+    GATE_T_TILE = TOK_TILE // 2
+    for ge_idx in pl.spmd(
+        (PREFILL_T // GATE_T_TILE) * gate_exp_chunks,
+        name_hint="prefill_swa_gate_expand",
+    ):
+        tg_idx = ge_idx // gate_exp_chunks
+        gn = ge_idx % gate_exp_chunks
+        tg = tg_idx * GATE_T_TILE
+        n0 = gn * K_CHUNK
+        ge_acc = pl.matmul(
+            pl.slice(
+                gate_score_t,
+                [GATE_T_TILE, NUM_HEADS_SWA_LOCAL_PAD], [tg, 0],
+            ),
+            pl.slice(gate_r, [NUM_HEADS_SWA_LOCAL_PAD, K_CHUNK], [0, n0]),
+            out_dtype=pl.FP32,
+        )
+        gate_exp = pl.assemble(
+            gate_exp, pl.cast(ge_acc, target_type=pl.BF16), [tg, n0],
+        )
+
+    attn_out_gated = pl.create_tensor(
+        [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16,
+    )
+    for ag_idx in pl.spmd(
+        (PREFILL_T // GATE_T_TILE) * gate_exp_chunks,
+        name_hint="prefill_swa_gate_apply",
+    ):
+        tg_idx = ag_idx // gate_exp_chunks
+        an = ag_idx % gate_exp_chunks
+        tg = tg_idx * GATE_T_TILE
+        n0 = an * K_CHUNK
+        a_slab = pl.cast(
+            pl.slice(attn_out, [GATE_T_TILE, K_CHUNK], [tg, n0]),
+            target_type=pl.FP32,
+        )
+        e_slab = pl.cast(
+            pl.slice(gate_exp, [GATE_T_TILE, K_CHUNK], [tg, n0]),
+            target_type=pl.FP32,
+        )
+        gated = pl.cast(pl.mul(a_slab, e_slab), target_type=pl.BF16)
+        attn_out_gated = pl.assemble(attn_out_gated, gated, [tg, n0])
+
+    # NaN diag: post-gate attention output (pre-o_proj).
+    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_attn_out_gated_dump"):
+        # for kb in pl.range(HIDDEN_Q_SWA_LOCAL // K_CHUNK):
+            # k0 = kb * K_CHUNK
+            # attn_out_gated_dump = pl.assemble(
+                # attn_out_gated_dump,
+                # pl.slice(attn_out_gated, [PREFILL_T, K_CHUNK], [0, k0]),
+                # [0, k0],
+            # )
 
     # ── Scope 3.a — local o_proj. ────────────────────────────────────────
     out_proj_k_blocks = HIDDEN_Q_SWA_LOCAL // 256
@@ -756,9 +1044,19 @@ def attention_swa_prefill(
         )
         partial_attn_proj = pl.assemble(
             partial_attn_proj,
-            pl.cast(fp32_chunk, target_type=pl.BF16),
+            pl.cast(fp32_chunk, target_type=pl.BF16, mode="rint"),
             [tg, o0],
         )
+
+    # NaN diag: local o_proj output (pre-all-reduce).
+    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_o_proj_dump"):
+        # for kb in pl.range(HIDDEN // K_CHUNK):
+            # k0 = kb * K_CHUNK
+            # o_proj_dump = pl.assemble(
+                # o_proj_dump,
+                # pl.slice(partial_attn_proj, [PREFILL_T, K_CHUNK], [0, k0]),
+                # [0, k0],
+            # )
 
     # ── Scope 3.b — TP all-reduce. ───────────────────────────────────────
     # Phase X.9: the pull-side ring body now lives as the consumer
@@ -768,13 +1066,28 @@ def attention_swa_prefill(
     # Phase A (2026-06-12): mirror of decode 15.B — at TP=1 the all-reduce
     # is a no-op (no peers); skip the call so the orchestration codegen
     # does not emit a stale SSA rename for the (now-empty) ring body.
-    if TP_WORLD_SIZE > 1:
+    if tp_size > 1:
         partial_attn_proj = self.tp_all_reduce(
             partial_attn_proj,
             tmp_window,
             signal_window,
             my_rank,
         )
+
+    # Module dump 5b: post_attn_residual.attn_delta (o_proj output,
+    # post-all-reduce, pre-residual-add).
+    if _DUMP_ENABLED:
+        attn_delta_dump = pl.assemble(attn_delta_dump, partial_attn_proj, [0, 0])
+
+    # NaN diag: o_proj output after TP all-reduce (pre-residual-add).
+    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_o_proj_reduced_dump"):
+        # for kb in pl.range(HIDDEN // K_CHUNK):
+            # k0 = kb * K_CHUNK
+            # o_proj_reduced_dump = pl.assemble(
+                # o_proj_reduced_dump,
+                # pl.slice(partial_attn_proj, [PREFILL_T, K_CHUNK], [0, k0]),
+                # [0, k0],
+            # )
 
     # ── Scope 3.c — residual add. ────────────────────────────────────────
     for ra_idx in pl.spmd(
@@ -801,7 +1114,7 @@ def attention_swa_prefill(
         )
         resid1_out = pl.assemble(
             resid1_out,
-            pl.cast(pl.add(reduced, resid), target_type=pl.BF16),
+            pl.cast(pl.add(reduced, resid), target_type=pl.BF16, mode="rint"),
             [tg, o0],
         )
 
@@ -818,12 +1131,11 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             f"HIDDEN={HIDDEN} must be divisible by tp_size={tp_size}"
         )
     body_inline = pl.inline(attention_swa_prefill._func)
-    tp_chunk = HIDDEN // tp_size
 
     @pl.program
     class PrefillAttentionSwa:
         # ---------- Collective: TP all_reduce (Phase X.9, mirrors decode). ----
-        # Pull-side ring body lifted from ``collectives.tp_all_reduce``.
+        # Barrier-style body (mirrors decode moe.py:270-313, PASS TP=8).
         # ``t_rows = PREFILL_T``, ``d_cols = HIDDEN``, ``group_size = tp_size``
         # are baked in from this factory's closure.
         @pl.function(type=pl.FunctionType.InCore)
@@ -831,72 +1143,55 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             self,
             local: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
             tmp_window: pld.DistributedTensor[
-                [PREFILL_T, tp_chunk], pl.BF16
+                [PREFILL_T, HIDDEN], pl.BF16
             ],
             signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16]:
+            # Barrier-style all-reduce (mirrors decode moe.py:270-313 tp_all_reduce,
+            # PASS TP=8). Replaces the pull-side RING which deadlocked at TP=8
+            # (monotonic AtomicAdd signal — see task #2). tmp_window is full
+            # [PREFILL_T, HIDDEN] (not chunked) so each rank stages its whole
+            # contribution before the barrier, then reduces every chunk across
+            # all peers. ar_chunk = HIDDEN // 8 (fixed, §7a) keeps the fp32
+            # accumulator [BATCH, ar_chunk] = 32KB inside UB at every TP.
             group_size = tp_size
-            t_rows = PREFILL_T
-            d_cols = HIDDEN
-            chunk = d_cols // group_size
-
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + group_size) % group_size
-                recv_idx = (my_rank - step - 1 + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-                send_tile = pl.load(
-                    local, [0, send_idx * chunk], [t_rows, chunk],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
-                pld.system.notify(
-                    target=signal_window, peer=next_rank,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    target=signal_window,
-                    offsets=[prev_rank, 0],
-                    value=step + 1,
-                    cmp=pld.WaitCmp.Ge,
-                )
-                recv_tile = pld.tile.remote_load(
-                    tmp_window, [0, 0], [t_rows, chunk], peer=prev_rank,
-                )
-                local_tile = pl.load(
-                    local, [0, recv_idx * chunk], [t_rows, chunk],
-                )
-                summed = pl.add(local_tile, recv_tile)
-                pl.store(summed, [0, recv_idx * chunk], local)
-
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + 1 + group_size) % group_size
-                recv_idx = (my_rank - step + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-                send_tile = pl.load(
-                    local, [0, send_idx * chunk], [t_rows, chunk],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
-                pld.system.notify(
-                    target=signal_window, peer=next_rank,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    target=signal_window,
-                    offsets=[prev_rank, 0],
-                    value=(group_size - 1) + step + 1,
-                    cmp=pld.WaitCmp.Ge,
-                )
-                recv_tile = pld.tile.remote_load(
-                    tmp_window, [0, 0], [t_rows, chunk], peer=prev_rank,
-                )
-                pl.store(recv_tile, [0, recv_idx * chunk], local)
-
+            ar_chunk = HIDDEN // 8
+            for tt in pl.range(PREFILL_TILE_COUNT):
+                ttr = tt * BATCH
+                for k0 in pl.range(0, HIDDEN, ar_chunk):
+                    stage_tile = pl.load(local, [ttr, k0], [BATCH, ar_chunk])
+                    pl.store(stage_tile, [ttr, k0], tmp_window)
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            for tt in pl.range(PREFILL_TILE_COUNT):
+                ttr = tt * BATCH
+                for k0 in pl.range(0, HIDDEN, ar_chunk):
+                    own_tile = pl.load(tmp_window, [ttr, k0], [BATCH, ar_chunk])
+                    acc = pl.cast(own_tile, target_type=pl.FP32)
+                    for peer in pl.range(group_size):
+                        if peer != my_rank:
+                            recv = pld.tile.remote_load(
+                                tmp_window, peer=peer,
+                                offsets=[ttr, k0], shape=[BATCH, ar_chunk],
+                            )
+                            acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+                    pl.store(
+                        pl.cast(acc, target_type=pl.BF16, mode="rint"), [ttr, k0], local,
+                    )
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -929,19 +1224,68 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             w_g: pl.Tensor[
                 [LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16
+            ],
             positions: pl.Tensor[[PREFILL_T], pl.INT32],
             resid1_out: pl.Out[
                 pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16]
             ],
             tmp_window: pld.DistributedTensor[
-                [PREFILL_T, tp_chunk], pl.BF16
+                [PREFILL_T, HIDDEN], pl.BF16
             ],
             signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            attn_out_dump = pl.create_tensor(
+                [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16,
+            )
+            o_proj_dump = pl.create_tensor(
+                [PREFILL_T, HIDDEN], dtype=pl.BF16,
+            )
+            attn_out_gated_dump = pl.create_tensor(
+                [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16,
+            )
+            o_proj_reduced_dump = pl.create_tensor(
+                [PREFILL_T, HIDDEN], dtype=pl.BF16,
+            )
+            scores_dump = pl.create_tensor(
+                [PREFILL_T * 16, 128], dtype=pl.FP32,
+            )
+            _dummy_input_norm = pl.create_tensor(
+                [PREFILL_T, HIDDEN], dtype=pl.BF16,
+            )
+            _dummy_q = pl.create_tensor(
+                [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32,
+            )
+            _dummy_k = pl.create_tensor(
+                [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
+            )
+            _dummy_v_proj = pl.create_tensor(
+                [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
+            )
+            _dummy_v_tile = pl.create_tensor(
+                [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.BF16,
+            )
+            _dummy_qn = pl.create_tensor(
+                [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32,
+            )
+            _dummy_kn = pl.create_tensor(
+                [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
+            )
+            _dummy_gate = pl.create_tensor(
+                [PREFILL_T, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.BF16,
+            )
+            _dummy_attn_delta = pl.create_tensor(
+                [PREFILL_T, HIDDEN], dtype=pl.BF16,
+            )
+            _dummy_v = pl.create_tensor(
+                [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.BF16,
+            )
             resid1_out = body_inline(
                 current_hidden,
                 input_rms_weight,
@@ -951,9 +1295,26 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 positions,
                 resid1_out,
-                layer_idx,
+                _dummy_v,
+                attn_out_dump,
+                attn_out_gated_dump,
+                o_proj_dump,
+                o_proj_reduced_dump,
+                scores_dump,
+                _dummy_input_norm,
+                _dummy_q,
+                _dummy_k,
+                _dummy_v_proj,
+                _dummy_v_tile,
+                _dummy_qn,
+                _dummy_kn,
+                _dummy_gate,
+                _dummy_attn_delta,
+                norm_layer_idx,
+                attn_layer_idx,
                 tmp_window,
                 signal_window,
                 my_rank,
@@ -1006,17 +1367,21 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             w_g: pl.Tensor[
                 [tp_size, LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [tp_size, NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16
+            ],
             positions: pl.Tensor[[tp_size, PREFILL_T], pl.INT32],
             resid1_out: pl.Out[
                 pl.Tensor[[tp_size, PREFILL_T, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
         ):
-            tmp_buf = pld.alloc_window_buffer(PREFILL_T * tp_chunk * 2)
+            tmp_buf = pld.alloc_window_buffer(PREFILL_T * HIDDEN * 2)
             sig_buf = pld.alloc_window_buffer(tp_size * 4)
             for r in pl.range(pld.world_size()):
                 tmp_window = pld.window(
-                    tmp_buf, [PREFILL_T, tp_chunk], dtype=pl.BF16,
+                    tmp_buf, [PREFILL_T, HIDDEN], dtype=pl.BF16,
                 )
                 signal_window = pld.window(
                     sig_buf, [tp_size, 1], dtype=pl.INT32,
@@ -1030,10 +1395,12 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     positions[r],
                     resid1_out[r],
                     tmp_window, signal_window,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     r,
                     device=r,
                 )
@@ -1179,14 +1546,14 @@ def _torch_per_rank_partial_swa(
 
 
 def _run_distributed_mock(
-    *, layer_idx: int = 1, pass_rate: float = 0.97,
+    *, norm_layer_idx: int = 1, pass_rate: float = 0.97,
     rtol: float = 1e-2, atol: float = 1e-2, seed: int = 0,
 ):
     """Mock 8-rank simulation of the prefill SWA body."""
     import torch
 
     torch.manual_seed(seed)
-    layer_rope_theta = LAYER_ROPE_THETA[layer_idx]
+    layer_rope_theta = LAYER_ROPE_THETA[norm_layer_idx]
     rope_cos, rope_sin = build_plain_rope_tables(
         MAX_SEQ_DEFAULT, ROTARY_DIM, layer_rope_theta,
     )
@@ -1261,38 +1628,366 @@ def _run_distributed_mock(
     return ok
 
 
+def golden_attention_swa_prefill(tensors):
+    """Torch reference for the SWA prefill body at TP=1 (single-rank local).
+
+    Reads the scratch dict produced by :func:`golden.runner.run` (specs
+    carry a leading rank dim of 1), computes the body's math in torch, and
+    writes ``resid1_out[0]``. Semantics: zero-centred RMSNorm + per-rank
+    Q/K/V/gate proj + per-head q/k norm + full RoPE + causal SWA attention
+    + head-wise sigmoid gate + local o_proj + residual add. The TP
+    all-reduce is a no-op at TP=1, so resid1 = local_partial_o + hidden.
+    """
+    import math
+
+    import torch
+
+    # Scratch tensors carry a leading rank dim ([1, ...]); index [0].
+    hidden = tensors["current_hidden"][0].float()
+    input_rms_weight = tensors["input_rms_weight"][0].float()
+    wq = tensors["wq"][0].float()
+    wk = tensors["wk"][0].float()
+    wv = tensors["wv"][0].float()
+    wo = tensors["wo"][0].float()
+    w_g = tensors["w_g"][0].float()
+    q_norm_weight = tensors["q_norm_weight"][0].float()
+    k_norm_weight = tensors["k_norm_weight"][0].float()
+    rope_cos = tensors["rope_cos"][0].float()
+    rope_sin = tensors["rope_sin"][0].float()
+    positions = tensors["positions"][0]
+    norm_layer_idx = int(tensors["norm_layer_idx"])
+    attn_layer_idx = int(tensors["attn_layer_idx"])
+
+    layer_hidden_base = attn_layer_idx * HIDDEN
+    layer_qhidden_base = attn_layer_idx * HIDDEN_Q_SWA_LOCAL
+
+    wq_local = wq[layer_hidden_base : layer_hidden_base + HIDDEN, :]
+    wk_local = wk[layer_hidden_base : layer_hidden_base + HIDDEN, :]
+    wv_local = wv[layer_hidden_base : layer_hidden_base + HIDDEN, :]
+    wo_local = wo[layer_qhidden_base : layer_qhidden_base + HIDDEN_Q_SWA_LOCAL, :]
+    w_g_local = w_g[
+        layer_hidden_base : layer_hidden_base + HIDDEN, :NUM_HEADS_SWA_LOCAL,
+    ]
+    input_rms_row = input_rms_weight[norm_layer_idx]
+    q_norm_row = q_norm_weight[norm_layer_idx]
+    k_norm_row = k_norm_weight[norm_layer_idx]
+
+    qkv = _torch_prefill_qkv_oracle_impl(
+        hidden=hidden,
+        input_rms_weight=input_rms_row,
+        wq_full=wq_local, wk_full=wk_local, wv_full=wv_local,
+        q_norm_weight=q_norm_row, k_norm_weight=k_norm_row,
+        w_g_full=w_g_local,
+        rope_cos=rope_cos, rope_sin=rope_sin,
+        positions=positions,
+        num_heads_full=NUM_HEADS_SWA_LOCAL,
+        num_kv_heads_full=KV_HEADS_LOCAL,
+        rotary_half=ROTARY_HALF,
+    )
+    q_rot = qkv["q_rot"].float()
+    k_rot = qkv["k_rot"].float()
+    v_proj = qkv["v_proj"].float()
+    gate_logits = qkv["gate_logits"]
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    t = hidden.shape[0]
+    attn_out = torch.zeros(t, NUM_HEADS_SWA_LOCAL, HEAD_DIM)
+    for ti in range(t):
+        pos = int(positions[ti].item())
+        start = max(0, pos - WIN + 1)
+        end = pos + 1
+        for kvh in range(KV_HEADS_LOCAL):
+            q_base = kvh * Q_PER_KV
+            q_grp = q_rot[ti, q_base : q_base + Q_PER_KV, :]
+            k_block = k_rot[start:end, kvh, :]
+            v_block = v_proj[start:end, kvh, :]
+            scores = (q_grp @ k_block.T) * scale
+            probs = torch.softmax(scores, dim=-1)
+            ctx = probs @ v_block
+            attn_out[ti, q_base : q_base + Q_PER_KV, :] = ctx
+
+    gate = torch.sigmoid(gate_logits).unsqueeze(-1)
+    attn_gated = (attn_out * gate).to(torch.bfloat16)
+    attn_flat = attn_gated.view(t, NUM_HEADS_SWA_LOCAL * HEAD_DIM)
+    partial_o = attn_flat.float() @ wo_local.float()
+    resid1 = (partial_o + hidden).to(torch.bfloat16)
+    tensors["resid1_out"][0] = resid1
+
+
+def build_tensor_specs(norm_layer_idx: int = 1, attn_layer_idx: int = 0):
+    """Synthetic single-card (TP=1) tensor specs for the SWA prefill body.
+
+    Shapes mirror the body's tensor parameter shapes with a leading rank
+    dim of 1 (the ``@pl.program`` host_orch convention for
+    ``golden.runner.run``). Weights are layer-major so the spec is reusable
+    for any ``layer_idx``; the oracle slices by ``layer_idx`` at compute
+    time. ``positions`` / ``slot_mapping`` are ``arange`` and ``block_table``
+    is the identity map so the body's KV-cache write-then-read indirection
+    lands on consistent rows. ``k_cache`` / ``v_cache`` are zero-init
+    scratch the body writes and reads in place; only ``resid1_out`` is
+    validated.
+    """
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    torch.manual_seed(0)
+
+    # wo stack height = LAYER_QHIDDEN_ROWS_DYN (staticized to 33 swa layers x
+    # HIDDEN_Q_SWA_LOCAL). Deriving from LAYER_HIDDEN_ROWS_DYN // HIDDEN (= 12, the
+    # full-attention-layer count) under-sizes the stack for the 33 swa layers.
+    layer_qhidden_rows = LAYER_QHIDDEN_ROWS_DYN
+
+    theta = LAYER_ROPE_THETA[norm_layer_idx]
+    rope_cos, rope_sin = build_plain_rope_tables(
+        MAX_SEQ_DEFAULT, ROTARY_DIM, theta,
+    )
+    rope_cos_4d = rope_cos.unsqueeze(0)
+    rope_sin_4d = rope_sin.unsqueeze(0)
+    rope_shape = [1, ROPE_SEQ_DYN, ROTARY_DIM]
+
+    proj_scale = 0.5
+
+    def init_hidden():
+        return ((torch.rand(PREFILL_T, HIDDEN) - 0.5).bfloat16()).unsqueeze(0)
+
+    def init_input_rms():
+        return (
+            ((torch.rand(LAYER_DYN, HIDDEN) - 0.5) * 0.1).float()
+        ).unsqueeze(0)
+
+    def init_wq():
+        return (
+            (torch.rand(LAYER_HIDDEN_ROWS_DYN, HIDDEN_Q_SWA_LOCAL) - 0.5)
+            / (HIDDEN ** 0.5)
+        ).bfloat16().unsqueeze(0)
+
+    def init_wkv(scale):
+        return (
+            scale
+            * (torch.rand(LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL) - 0.5)
+            / (HIDDEN ** 0.5)
+        ).bfloat16().unsqueeze(0)
+
+    def init_wo():
+        return (
+            proj_scale
+            * (torch.rand(layer_qhidden_rows, HIDDEN) - 0.5)
+            / (HIDDEN_Q_SWA_LOCAL ** 0.5)
+        ).bfloat16().unsqueeze(0)
+
+    def init_w_g():
+        return (
+            proj_scale
+            * (torch.rand(LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD) - 0.5)
+            / (HIDDEN ** 0.5)
+        ).bfloat16().unsqueeze(0)
+
+    def init_gate_r():
+        # Block-diagonal expander R [NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL]:
+        # gate_exp[t, h*HEAD_DIM + d] = gate_score[t, h]. Real heads 0..11 carry
+        # a 1-block across their HEAD_DIM; pad heads 12..15 are all zero.
+        r = torch.zeros(
+            NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL, dtype=torch.bfloat16,
+        )
+        for h in range(NUM_HEADS_SWA_LOCAL):
+            r[h, h * HEAD_DIM:(h + 1) * HEAD_DIM] = 1.0
+        return r.unsqueeze(0)
+
+    def init_qk_norm():
+        return (
+            ((torch.rand(LAYER_DYN, HEAD_DIM) - 0.5) * 0.1).float()
+        ).unsqueeze(0)
+
+    def init_block_table():
+        return torch.arange(BLOCK_TABLE_FLAT_DYN, dtype=torch.int32).unsqueeze(0)
+
+    def init_slot_mapping():
+        return torch.arange(PREFILL_T, dtype=torch.int32).unsqueeze(0)
+
+    def init_positions():
+        return torch.arange(PREFILL_T, dtype=torch.int32).unsqueeze(0)
+
+    def init_rope(tbl):
+        return tbl.narrow(1, 0, ROPE_SEQ_DYN).contiguous()
+
+    return [
+        TensorSpec(
+            "current_hidden", [1, PREFILL_T, HIDDEN], torch.bfloat16,
+            init_value=init_hidden,
+        ),
+        TensorSpec(
+            "input_rms_weight", [1, LAYER_DYN, HIDDEN], torch.float32,
+            init_value=init_input_rms,
+        ),
+        TensorSpec(
+            "wq", [1, LAYER_HIDDEN_ROWS_DYN, HIDDEN_Q_SWA_LOCAL], torch.bfloat16,
+            init_value=init_wq,
+        ),
+        TensorSpec(
+            "wk", [1, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], torch.bfloat16,
+            init_value=lambda: init_wkv(1.0),
+        ),
+        TensorSpec(
+            "wv", [1, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], torch.bfloat16,
+            init_value=lambda: init_wkv(proj_scale),
+        ),
+        TensorSpec(
+            "q_norm_weight", [1, LAYER_DYN, HEAD_DIM], torch.float32,
+            init_value=init_qk_norm,
+        ),
+        TensorSpec(
+            "k_norm_weight", [1, LAYER_DYN, HEAD_DIM], torch.float32,
+            init_value=init_qk_norm,
+        ),
+        TensorSpec(
+            "block_table", [1, BLOCK_TABLE_FLAT_DYN], torch.int32,
+            init_value=init_block_table,
+        ),
+        TensorSpec(
+            "slot_mapping", [1, PREFILL_T], torch.int32,
+            init_value=init_slot_mapping,
+        ),
+        TensorSpec(
+            "rope_cos", rope_shape, torch.float32,
+            init_value=lambda: init_rope(rope_cos_4d),
+        ),
+        TensorSpec(
+            "rope_sin", rope_shape, torch.float32,
+            init_value=lambda: init_rope(rope_sin_4d),
+        ),
+        TensorSpec(
+            "k_cache", [1, KV_CACHE_ROWS_DYN, HEAD_DIM], torch.bfloat16,
+            init_value=None,
+        ),
+        TensorSpec(
+            "v_cache", [1, KV_CACHE_ROWS_DYN, HEAD_DIM], torch.bfloat16,
+            init_value=None,
+        ),
+        TensorSpec(
+            "wo", [1, layer_qhidden_rows, HIDDEN], torch.bfloat16,
+            init_value=init_wo,
+        ),
+        TensorSpec(
+            "w_g", [1, LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD],
+            torch.bfloat16, init_value=init_w_g,
+        ),
+        TensorSpec(
+            "gate_r", [1, NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL],
+            torch.bfloat16, init_value=init_gate_r,
+        ),
+        TensorSpec(
+            "positions", [1, PREFILL_T], torch.int32,
+            init_value=init_positions,
+        ),
+        TensorSpec(
+            "resid1_out", [1, PREFILL_T, HIDDEN], torch.bfloat16, is_output=True,
+        ),
+        ScalarSpec("norm_layer_idx", torch.int32, norm_layer_idx),
+        ScalarSpec("attn_layer_idx", torch.int32, attn_layer_idx),
+    ]
+
+
+def _run_tp1_golden(
+    *, platform: str = "a2a3", device: int = 4,
+    norm_layer_idx: int = 1, attn_layer_idx: int = 0,
+    atol: float = 0.05, rtol: float = 0.05, max_error_ratio: float = 0.05,
+    compile_only: bool = False,
+):
+    """TP=1 NPU body verification on device ``device`` via golden.runner.run.
+
+    Builds ``_build_tp_prefill_attention_swa_program(tp_size=1)`` (the
+    ``@pl.program`` supplies ``self.tp_all_reduce``; at TP=1 the ring body
+    is a no-op), runs it on one card, and validates ``resid1_out`` against
+    :func:`golden_attention_swa_prefill` with ``ratio_allclose`` (5% cap,
+    atol=rtol=0.05).
+    """
+    from golden.runner import run
+    from golden.validation import ratio_allclose
+    from pypto.ir.distributed_compiled_program import DistributedConfig
+
+    program = _build_tp_prefill_attention_swa_program(tp_size=1)
+    specs = build_tensor_specs(
+        norm_layer_idx=norm_layer_idx, attn_layer_idx=attn_layer_idx,
+    )
+    compile_cfg = {
+        "distributed_config": DistributedConfig(
+            device_ids=[device], num_sub_workers=0,
+        ),
+    }
+    runtime_cfg = dict(platform=platform, device_id=device)
+    compare_fn = {
+        "resid1_out": ratio_allclose(
+            atol=atol, rtol=rtol, max_error_ratio=max_error_ratio,
+        ),
+    }
+    return run(
+        program=program,
+        specs=specs,
+        golden_fn=golden_attention_swa_prefill,
+        compile_cfg=compile_cfg,
+        runtime_cfg=runtime_cfg,
+        rtol=rtol,
+        atol=atol,
+        compare_fn=compare_fn,
+        compile_only=compile_only,
+    )
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-p", "--platform", default="a2a3sim",
-        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+    parser = argparse.ArgumentParser(
+        description=(
+            "Step3p5 prefill SWA attention body: TP=1 NPU golden "
+            "verification (L0). Compiles the body via "
+            "_build_tp_prefill_attention_swa_program(tp_size=1) and "
+            "validates resid1_out against golden_attention_swa_prefill "
+            "with ratio_allclose (5% cap, atol=rtol=0.05)."
+        ),
     )
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--layer-idx", type=int, default=1)
-    parser.add_argument("--pass-rate", type=float, default=0.97)
-    parser.add_argument("--rtol", type=float, default=1e-2)
-    parser.add_argument("--atol", type=float, default=1e-2)
+    parser.add_argument(
+        "-p", "--platform", default="a2a3",
+        choices=["a2a3"],
+        help="Real-device platform only (sim forbidden).",
+    )
+    parser.add_argument("-d", "--device", type=int, default=4)
+    parser.add_argument("--norm-layer-idx", type=int, default=1)
+    parser.add_argument("--attn-layer-idx", type=int, default=0)
+    parser.add_argument("--atol", type=float, default=0.05)
+    parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument("--max-error-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--compile-only", action="store_true",
+        help="Stop after codegen (no execute / no validate).",
+    )
+    parser.add_argument(
+        "--distributed-mock", action="store_true",
+        help="Run the legacy torch-only 8-rank distributed mock instead.",
+    )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--build-program-only", action="store_true")
     args = parser.parse_args()
 
-    program_cls = _build_tp_prefill_attention_swa_program(TP_WORLD_SIZE)
-    print(
-        f"[OK] built @pl.program PrefillAttentionSwa: {program_cls.__name__} "
-        f"(tp_size={TP_WORLD_SIZE}, T={PREFILL_T})"
+    if args.distributed_mock:
+        ok = _run_distributed_mock(
+            norm_layer_idx=args.norm_layer_idx,
+            pass_rate=0.97,
+            rtol=args.rtol, atol=args.atol,
+            seed=args.seed,
+        )
+        raise SystemExit(0 if ok else 1)
+
+    res = _run_tp1_golden(
+        platform=args.platform,
+        device=args.device,
+        norm_layer_idx=args.norm_layer_idx,
+        attn_layer_idx=args.attn_layer_idx,
+        atol=args.atol,
+        rtol=args.rtol,
+        max_error_ratio=args.max_error_ratio,
+        compile_only=args.compile_only,
     )
-    if args.build_program_only:
-        raise SystemExit(0)
-    ok = _run_distributed_mock(
-        layer_idx=args.layer_idx,
-        pass_rate=args.pass_rate,
-        rtol=args.rtol, atol=args.atol,
-        seed=args.seed,
-    )
-    if not ok:
-        raise SystemExit(1)
+    print(f"[prefill_attention_swa] TP=1 NPU golden: {res}", flush=True)
+    raise SystemExit(0 if res.passed else 1)
 
 
 __all__ = [
@@ -1315,4 +2010,7 @@ __all__ = [
     "_torch_single_card_prefill_swa",
     "_torch_per_rank_partial_swa",
     "_run_distributed_mock",
+    "golden_attention_swa_prefill",
+    "build_tensor_specs",
+    "_run_tp1_golden",
 ]

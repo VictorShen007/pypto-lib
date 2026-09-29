@@ -98,8 +98,6 @@ from ._ops import (
     build_plain_rope_tables,
     head_wise_gate_apply,
     partial_rope_rotate,
-    per_head_qk_norm,
-    zero_centered_rmsnorm_apply,
 )
 from .config import (
     ATTN_SCALE,

@@ -16,7 +16,7 @@ DEFAULT_GOLDEN_ROOT = Path(
     "golden_step3p5_w8a8_prefill_vllm"
 )
 DEFAULT_CKPT_DIR = Path(
-    "/mnt/nvme1/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp"
+    "/mnt/hw910test-jfs/models/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp"
 )
 
 

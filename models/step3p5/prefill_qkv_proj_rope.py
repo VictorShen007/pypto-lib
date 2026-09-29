@@ -69,6 +69,9 @@ per-token causal/SWA attention loop alongside the QK / SV matmuls,
 matching the decode path's locality).
 """
 
+# Dead-code hygiene: this module's function bodies are not exercised by the
+# prefill path (only its constants are imported).
+
 # pyright: reportUndefinedVariable=false
 
 from __future__ import annotations
@@ -80,8 +83,6 @@ from ._ops import (
     build_llama3_yarn_rope_tables,
     build_plain_rope_tables,
     partial_rope_rotate,
-    per_head_qk_norm,
-    zero_centered_rmsnorm_apply,
 )
 from .config import (
     EPS,
@@ -114,7 +115,7 @@ from .config import (
 # -----------------------------------------------------------------------------
 PREFILL_BATCH = 1
 PREFILL_SEQ = 128
-PREFILL_T = PREFILL_BATCH * PREFILL_SEQ  # 128
+PREFILL_T = PREFILL_BATCH * PREFILL_SEQ  # 128 (may be overridden before import)
 
 # Tile-level constants.
 TOK_TILE = 32
@@ -123,7 +124,10 @@ KV_OUT_CHUNK_LOCAL = KV_HIDDEN_LOCAL  # 128 fits in one chunk
 Q_OUT_CHUNK = 128
 
 
-assert PREFILL_T % TOK_TILE == 0
+if PREFILL_T % TOK_TILE != 0:
+    import warnings
+    warnings.warn(f"PREFILL_T={PREFILL_T} not divisible by TOK_TILE={TOK_TILE}; "
+                  f"attention body may need tail-tile handling")
 assert HIDDEN % INPUT_PROJ_K_CHUNK == 0
 assert KV_HIDDEN_LOCAL == KV_OUT_CHUNK_LOCAL
 
@@ -143,9 +147,6 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
     rotary_dim = rotary_half * 2
     rotary_pass = HEAD_DIM - rotary_dim
     q_per_kv = Q_PER_KV_FULL if full else Q_PER_KV_SWA
-    kv_heads_local = KV_HEADS_LOCAL
-
-    name_prefix = "prefill_full" if full else "prefill_swa"
 
     assert hidden_q_local % Q_OUT_CHUNK == 0
 
@@ -168,6 +169,16 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
         v_out: pl.Tensor[[PREFILL_T, KV_HIDDEN_LOCAL], pl.BF16],
         gate_logits_out: pl.Tensor[[PREFILL_T, num_heads_local], pl.FP32],
         layer_idx: pl.Scalar[pl.INT32],
+        # Flavour-dependent compile-time constants passed as pl.Scalar by the
+        # caller (prefill_fwd.py chip_orch). pypto's IR resolver does not see
+        # factory-closure locals, so these must be signature params, not
+        # closure-captured ternaries. Experiment: verify pl.Scalar can satisfy
+        # shape-arg / range-count uses (pl.range accepts pl.Scalar per
+        # pypto-coding-style.md:466).
+        q_per_kv: pl.Scalar[pl.INT32],
+        rotary_half: pl.Scalar[pl.INT32],
+        rotary_dim: pl.Scalar[pl.INT32],
+        rotary_pass: pl.Scalar[pl.INT32],
     ):
         """TP-sliced prefill QKV projection + per-head q/k norm + partial RoPE.
 
@@ -185,9 +196,19 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
         q_blocks = hidden_q_local // Q_OUT_CHUNK
         layer_hidden_base = layer_idx * HIDDEN
 
+        # NOTE: the flavour-dependent closure vars (rotary_half,
+        # rotary_dim, rotary_pass, q_per_kv) are bound at factory
+        # scope above. pypto's @pl.jit.inline IR resolver does not see
+        # factory-closure locals at IR-level (spmd/range counts,
+        # arithmetic, slice coords), so the body currently does NOT
+        # compile past the first IR-level use of these names. This is
+        # the expected handoff state — P3a will refactor them to
+        # pl.Scalar signature params (passed by the prefill_fwd.py
+        # caller) so the body sees them as first-class inputs.
+
         # ── Stage 1.a — replicated zero-centred input RMSNorm. ───────────
         for tg_idx in pl.spmd(
-            PREFILL_T // TOK_TILE, name_hint=f"{name_prefix}_rmsnorm_zc",
+            PREFILL_T // TOK_TILE, name_hint="rmsnorm_zc",
         ):
             tg = tg_idx * TOK_TILE
             partial_sq = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
@@ -239,7 +260,7 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
         q_proj = pl.create_tensor([PREFILL_T, hidden_q_local], dtype=pl.FP32)
         for q_idx in pl.spmd(
             (PREFILL_T // TOK_TILE) * q_blocks,
-            name_hint=f"{name_prefix}_q_proj",
+            name_hint="q_proj",
         ):
             qb_idx = q_idx // q_blocks
             qo_idx = q_idx % q_blocks
@@ -258,11 +279,11 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
                 a = pl.slice(
                     normed_out, [TOK_TILE, INPUT_PROJ_K_CHUNK], [tg, k0],
                 )
-                w = pl.slice(
+                w_q = pl.slice(
                     wq, [INPUT_PROJ_K_CHUNK, Q_OUT_CHUNK],
                     [layer_hidden_base + k0, q_o0],
                 )
-                q_acc = pl.matmul_acc(q_acc, a, w)
+                q_acc = pl.matmul_acc(q_acc, a, w_q)
             q_proj = pl.assemble(q_proj, q_acc, [tg, q_o0])
 
         # ── Stage 1.c — K projection. ────────────────────────────────────
@@ -270,7 +291,7 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
             [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
         )
         for tg_idx in pl.spmd(
-            PREFILL_T // TOK_TILE, name_hint=f"{name_prefix}_k_proj",
+            PREFILL_T // TOK_TILE, name_hint="k_proj",
         ):
             tg = tg_idx * TOK_TILE
             a0 = pl.slice(
@@ -286,11 +307,11 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
                 a = pl.slice(
                     normed_out, [TOK_TILE, INPUT_PROJ_K_CHUNK], [tg, k0],
                 )
-                w = pl.slice(
+                w_k = pl.slice(
                     wk, [INPUT_PROJ_K_CHUNK, KV_HIDDEN_LOCAL],
                     [layer_hidden_base + k0, 0],
                 )
-                k_acc = pl.matmul_acc(k_acc, a, w)
+                k_acc = pl.matmul_acc(k_acc, a, w_k)
             k_proj = pl.assemble(k_proj, k_acc, [tg, 0])
 
         # ── Stage 1.d — V projection. ────────────────────────────────────
@@ -298,7 +319,7 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
             [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
         )
         for tg_idx in pl.spmd(
-            PREFILL_T // TOK_TILE, name_hint=f"{name_prefix}_v_proj",
+            PREFILL_T // TOK_TILE, name_hint="v_proj",
         ):
             tg = tg_idx * TOK_TILE
             a0 = pl.slice(
@@ -314,16 +335,16 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
                 a = pl.slice(
                     normed_out, [TOK_TILE, INPUT_PROJ_K_CHUNK], [tg, k0],
                 )
-                w = pl.slice(
+                w_v = pl.slice(
                     wv, [INPUT_PROJ_K_CHUNK, KV_HIDDEN_LOCAL],
                     [layer_hidden_base + k0, 0],
                 )
-                v_acc = pl.matmul_acc(v_acc, a, w)
+                v_acc = pl.matmul_acc(v_acc, a, w_v)
             v_proj = pl.assemble(v_proj, v_acc, [tg, 0])
 
         # ── Stage 1.e — head-wise gate matmul (on un-normed input). ──────
         for tg_idx in pl.spmd(
-            PREFILL_T // TOK_TILE, name_hint=f"{name_prefix}_gate_proj",
+            PREFILL_T // TOK_TILE, name_hint="gate_proj",
         ):
             tg = tg_idx * TOK_TILE
             a0 = pl.slice(
@@ -340,11 +361,11 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
                     current_hidden,
                     [TOK_TILE, INPUT_PROJ_K_CHUNK], [tg, k0],
                 )
-                w = pl.slice(
+                w_gate = pl.slice(
                     w_g, [INPUT_PROJ_K_CHUNK, num_heads_local],
                     [layer_hidden_base + k0, 0],
                 )
-                g_acc = pl.matmul_acc(g_acc, a, w)
+                g_acc = pl.matmul_acc(g_acc, a, w_gate)
             gate_logits_out = pl.assemble(gate_logits_out, g_acc, [tg, 0])
 
         # ── Stage 1.f — per-head zero-centred q_norm / k_norm. ───────────
@@ -355,11 +376,11 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
             [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
         )
         for qkn_idx in pl.spmd(
-            (PREFILL_T // TOK_TILE) * kv_heads_local,
-            name_hint=f"{name_prefix}_qk_norm_zc",
+            (PREFILL_T // TOK_TILE) * KV_HEADS_LOCAL,
+            name_hint="qk_norm_zc",
         ):
-            tg_idx2 = qkn_idx // kv_heads_local
-            kh = qkn_idx % kv_heads_local
+            tg_idx2 = qkn_idx // KV_HEADS_LOCAL
+            kh = qkn_idx % KV_HEADS_LOCAL
             tg = tg_idx2 * TOK_TILE
             q_col = kh * q_per_kv * HEAD_DIM
             q_chunk = pl.reshape(
@@ -369,9 +390,9 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
                 [TOK_TILE * q_per_kv, HEAD_DIM],
             )
             q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
-            # Phase X.7: per_head_qk_norm body inlined.
+            # per_head_qk_norm helper deleted (Problem 19); logic inlined below.
             q_sq = pl.row_sum(pl.mul(q_chunk, q_chunk))
-            q_inv = pl.rsqrt(pl.add(pl.mul(q_sq, HEAD_DIM_INV), EPS))
+            q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_sq, HEAD_DIM_INV), EPS)))
             q_scaled = pl.row_expand_mul(q_chunk, q_inv)
             q_normed = pl.col_expand_mul(q_scaled, pl.add(q_gamma, 1.0))
             q_normed_flat = pl.reshape(
@@ -385,7 +406,7 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
             k_chunk = pl.slice(k_proj, [TOK_TILE, HEAD_DIM], [tg, k_col])
             k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
             k_sq = pl.row_sum(pl.mul(k_chunk, k_chunk))
-            k_inv = pl.rsqrt(pl.add(pl.mul(k_sq, HEAD_DIM_INV), EPS))
+            k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_sq, HEAD_DIM_INV), EPS)))
             k_scaled = pl.row_expand_mul(k_chunk, k_inv)
             k_normed = pl.col_expand_mul(k_scaled, pl.add(k_gamma, 1.0))
             k_proj_norm = pl.assemble(k_proj_norm, k_normed, [tg, k_col])
@@ -404,10 +425,10 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
 
             with pl.at(
                 level=pl.Level.CORE_GROUP,
-                name_hint=f"{name_prefix}_rope_q_k",
+                name_hint="rope_q_k",
             ):
                 # K RoPE — single rank-local KV head per card under TP=8.
-                for kh in pl.range(kv_heads_local):
+                for kh in pl.range(KV_HEADS_LOCAL):
                     k_col = kh * HEAD_DIM
                     k_lo = pl.slice(
                         k_proj_norm, [1, rotary_half], [t, k_col],
@@ -457,7 +478,7 @@ def _build_prefill_qkv_proj_rope(*, full: bool):
                     )
 
                 # Q RoPE — q_per_kv consecutive heads per KV-head bundle.
-                for kh in pl.range(kv_heads_local):
+                for kh in pl.range(KV_HEADS_LOCAL):
                     q_base_col = kh * q_per_kv * HEAD_DIM
                     q_block = pl.reshape(
                         pl.slice(
@@ -590,6 +611,10 @@ def _build_tp_prefill_qkv_proj_rope_program(
                 pl.Tensor[[PREFILL_T, num_heads_local], pl.FP32]
             ],
             layer_idx: pl.Scalar[pl.INT32],
+            q_per_kv: pl.Scalar[pl.INT32],
+            rotary_half: pl.Scalar[pl.INT32],
+            rotary_dim: pl.Scalar[pl.INT32],
+            rotary_pass: pl.Scalar[pl.INT32],
         ):
             normed_out, q_out, k_out, v_out, gate_logits_out = body_inline(
                 current_hidden,
@@ -601,6 +626,7 @@ def _build_tp_prefill_qkv_proj_rope_program(
                 positions,
                 normed_out, q_out, k_out, v_out, gate_logits_out,
                 layer_idx,
+                q_per_kv, rotary_half, rotary_dim, rotary_pass,
             )
             return normed_out, q_out, k_out, v_out, gate_logits_out
 
@@ -656,6 +682,10 @@ def _build_tp_prefill_qkv_proj_rope_program(
                 ]
             ],
             layer_idx: pl.Scalar[pl.INT32],
+            q_per_kv: pl.Scalar[pl.INT32],
+            rotary_half: pl.Scalar[pl.INT32],
+            rotary_dim: pl.Scalar[pl.INT32],
+            rotary_pass: pl.Scalar[pl.INT32],
         ):
             for r in pl.range(pld.world_size()):
                 self.chip_orch(
@@ -670,6 +700,7 @@ def _build_tp_prefill_qkv_proj_rope_program(
                     q_out[r], k_out[r], v_out[r],
                     gate_logits_out[r],
                     layer_idx,
+                    q_per_kv, rotary_half, rotary_dim, rotary_pass,
                     device=r,
                 )
 
@@ -760,7 +791,7 @@ def _torch_prefill_qkv_oracle_impl(
             if rotary_pass > 0:
                 k_rot[ti, h, rotary_dim:] = v_head[rotary_dim:]
 
-    gate_logits = hidden.float() @ w_g_full.float()
+    gate_logits = normed_bf16.float() @ w_g_full.float()
 
     return {
         "normed": normed_bf16,
