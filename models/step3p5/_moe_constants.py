@@ -152,3 +152,4 @@ assert HIDDEN % SHARED_DOWN_N_CHUNK == 0
 # -----------------------------------------------------------------------------
 ROUTED_SWIGLU_LIMIT = 7.0
 SHARED_SWIGLU_LIMIT = 16.0
+

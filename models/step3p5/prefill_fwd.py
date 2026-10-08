@@ -82,8 +82,31 @@ from __future__ import annotations
 
 import os
 
+import os as _os
+
 import pypto.language as pl
 import pypto.language.distributed as pld
+
+# ── Perf-experiment gates (host-level constants, 2026-09-21). ──
+# These select inline-body variants at splice time (host-level Python if,
+# NOT a DSL static if: conditions inside a spliced inline body resolve in
+# the splicing module's scope, so variant selection must happen here where
+# these names are visible).
+#   PREFILL_ZERO_CHUNK: rows per zero-store in the EP buffer zero-fill
+#     (prefill_zero_dispatch_buffers[_chunked] / prefill_zero_routed_y_buf
+#     [_chunked]). 1 = original per-row stores; 4/8 = chunked stores.
+#   PREFILL_SER_MODE: _serialize_after_shared dependency-carrier size.
+#     0 = original full-row fold; 1 = one 32B chunk per row (the sh_y task
+#     edge stays declared; only in-task dummy loads shrink ~512x).
+PREFILL_ZERO_CHUNK = int(_os.environ.get("PYPTO_PREFILL_ZERO_CHUNK", "1"))
+PREFILL_SER_MODE = int(_os.environ.get("PYPTO_PREFILL_SER_MODE", "1"))  # 默认 1（2026-09-23 A/B 定案：ser=1 vs ser=0 同代码同日 -527ms/−13.8%，cos 0.9959 过门）
+# MEASUREMENT-ONLY PROBE (UNSAFE, never ship): skip the cross-layer WAR
+# fence to test whether it is on the critical path. Skipping can race
+# layer L's dispatch against layer L-1's combine drains.
+PREFILL_SKIP_CROSS_FENCE = int(
+    _os.environ.get("PYPTO_PREFILL_SKIP_CROSS_FENCE", "0")
+)
+
 
 from ._ops import build_plain_rope_tables, zero_centered_rmsnorm_apply
 # v1 refactor (design §7): prefill_dense_mlp_body is the extracted form
@@ -156,6 +179,7 @@ from .prefill_dispatch import (
     prefill_histogram_and_prefix_sum,
     prefill_pack_send_payload,
     prefill_zero_dispatch_buffers,
+    prefill_zero_dispatch_buffers_chunked,
 )
 from .prefill_expert_routed import (
     prefill_expert_routed_silu,
@@ -170,6 +194,7 @@ from .prefill_combine import (
     prefill_push_routed_y_to_sources,
     prefill_weighted_gather_and_add,
     prefill_zero_routed_y_buf,
+    prefill_zero_routed_y_buf_chunked,
 )
 
 
@@ -520,7 +545,12 @@ def _build_prefill_fwd_program(
     gate_inline = pl.inline(prefill_gate_body._func)
     histogram_inline = pl.inline(prefill_histogram_and_prefix_sum._func)
     pack_send_inline = pl.inline(prefill_pack_send_payload._func)
-    zero_dispatch_inline = pl.inline(prefill_zero_dispatch_buffers._func)
+    if PREFILL_ZERO_CHUNK == 1:
+        zero_dispatch_inline = pl.inline(prefill_zero_dispatch_buffers._func)
+    else:
+        zero_dispatch_inline = pl.inline(
+            prefill_zero_dispatch_buffers_chunked._func
+        )
     build_csr_inline = pl.inline(prefill_build_local_expert_csr._func)
     build_inverse_inline = pl.inline(prefill_build_inverse_map._func)
     routed_silu_inline = pl.inline(prefill_expert_routed_silu._func)
@@ -528,7 +558,10 @@ def _build_prefill_fwd_program(
     routed_swiglu7_inline = pl.inline(prefill_expert_routed_swiglu7._func)
     shared_swiglu16_inline = pl.inline(prefill_expert_shared_swiglu16._func)
     publish_route_inline = pl.inline(prefill_publish_src_route_table._func)
-    zero_routed_inline = pl.inline(prefill_zero_routed_y_buf._func)
+    if PREFILL_ZERO_CHUNK == 1:
+        zero_routed_inline = pl.inline(prefill_zero_routed_y_buf._func)
+    else:
+        zero_routed_inline = pl.inline(prefill_zero_routed_y_buf_chunked._func)
     push_routed_inline = pl.inline(prefill_push_routed_y_to_sources._func)
     gather_add_inline = pl.inline(prefill_weighted_gather_and_add._func)
 
@@ -746,39 +779,82 @@ def _build_prefill_fwd_program(
                 pl.Tensor[[BATCH, SCALE_W_PAD], pl.FP32]
             ],
         ):
+            if PREFILL_SER_MODE == 2:
+                # Tile-mode carrier: ONE [BATCH,16] sh_y read (covers every
+                # row's first 16 columns) folded as 0*x into ONE [BATCH,8]
+                # x_scale read -> x_scale_out write. Same task edge as
+                # SER_MODE 0/1; the per-row scalar loop is gone entirely.
+                # Exact (0*x adds no rounding).
+                yr_t = pl.cast(
+                    pl.load(sh_y, [0, 0], [BATCH, 2 * SCALE_W_PAD]),
+                    target_type=pl.FP32,
+                )
+                s_t = pl.add(
+                    pl.load(x_scale, [0, 0], [BATCH, SCALE_W_PAD]),
+                    pl.mul(
+                        pl.slice(yr_t, [BATCH, SCALE_W_PAD], [0, 0]),
+                        0.0,
+                    ),
+                )
+                pl.store(s_t, [0, 0], x_scale_out)
+                return x_scale_out
             for b in pl.range(BATCH):
                 s = pl.load(x_scale, [b, 0], [1, SCALE_W_PAD])
-                # sh_y is BF16: a [1, SCALE_W_PAD]=[1, 8] load has a 16-byte
-                # row (8*2B), which ptoas rejects (alloc_tile rows must be
-                # 32-byte aligned). Load a [1, 2*SCALE_W_PAD]=[1, 16] chunk
-                # (32B) and fold BOTH [1, SCALE_W_PAD] FP32 halves into s so
-                # the full sh_y row is still consumed for the dependency.
-                for k in pl.range(HIDDEN // (2 * SCALE_W_PAD)):
+                if PREFILL_SER_MODE == 0:
+                    # sh_y is BF16: a [1, SCALE_W_PAD]=[1, 8] load has a 16-byte
+                    # row (8*2B), which ptoas rejects (alloc_tile rows must be
+                    # 32-byte aligned). Load a [1, 2*SCALE_W_PAD]=[1, 16] chunk
+                    # (32B) and fold BOTH [1, SCALE_W_PAD] FP32 halves into s so
+                    # the full sh_y row is still consumed for the dependency.
+                    for k in pl.range(HIDDEN // (2 * SCALE_W_PAD)):
+                        yr16 = pl.cast(
+                            pl.load(
+                                sh_y,
+                                [b, k * 2 * SCALE_W_PAD],
+                                [1, 2 * SCALE_W_PAD],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        s = pl.add(
+                            s,
+                            pl.mul(
+                                pl.slice(
+                                    yr16, [1, SCALE_W_PAD], [0, 0],
+                                ),
+                                0.0,
+                            ),
+                        )
+                        s = pl.add(
+                            s,
+                            pl.mul(
+                                pl.slice(
+                                    yr16,
+                                    [1, SCALE_W_PAD],
+                                    [0, SCALE_W_PAD],
+                                ),
+                                0.0,
+                            ),
+                        )
+                else:
+                    # Minimal dependency carrier: one 32B sh_y chunk per row.
+                    # The sh_y task edge stays declared (whole tensor input);
+                    # only the in-task dummy-load count shrinks ~512x. Exact
+                    # (0*x adds no rounding).
                     yr16 = pl.cast(
-                        pl.load(
-                            sh_y,
-                            [b, k * 2 * SCALE_W_PAD],
-                            [1, 2 * SCALE_W_PAD],
-                        ),
+                        pl.load(sh_y, [b, 0], [1, 2 * SCALE_W_PAD]),
                         target_type=pl.FP32,
                     )
                     s = pl.add(
                         s,
                         pl.mul(
-                            pl.slice(
-                                yr16, [1, SCALE_W_PAD], [0, 0],
-                            ),
+                            pl.slice(yr16, [1, SCALE_W_PAD], [0, 0]),
                             0.0,
                         ),
                     )
                     s = pl.add(
                         s,
                         pl.mul(
-                            pl.slice(
-                                yr16,
-                                [1, SCALE_W_PAD],
-                                [0, SCALE_W_PAD],
-                            ),
+                            pl.slice(yr16, [1, SCALE_W_PAD], [0, SCALE_W_PAD]),
                             0.0,
                         ),
                     )
@@ -1062,6 +1138,14 @@ def _build_prefill_fwd_program(
                 my_rank,
             )
             running = pl.cast(0, pl.INT32)
+            # Incremental per-src in-expert offset: a running prefix over e
+            # maintained across the (e, src) loops. Replaces the per-(e,src)
+            # O(N_LOCAL_EXPERTS) re-sum of pub_counts (~5k scalar window
+            # reads per dispatch call = ~110k/tile-layer at 22 tiles) with
+            # O(1) accumulate — identical integer math, bit-identical values.
+            src_e_off_acc = pl.create_tensor([N_RANKS], dtype=pl.INT32)
+            for src0 in pl.range(N_RANKS):
+                pl.write(src_e_off_acc, [src0], pl.cast(0, pl.INT32))
             for e in pl.range(N_LOCAL_EXPERTS):
                 for src in pl.range(N_RANKS):
                     n = pl.cast(
@@ -1074,13 +1158,7 @@ def _build_prefill_fwd_program(
                     # src*BATCH*TOPK — NOT the variable-length recv_offsets
                     # prefix sum (Problem-27 src/dst skew).
                     src_base = pl.cast(src * (BATCH * TOPK), pl.INDEX)
-                    src_e_off = pl.cast(0, pl.INT32)
-                    for prev_e in pl.range(N_LOCAL_EXPERTS):
-                        if prev_e < e:
-                            src_e_off = src_e_off + pl.read(
-                                pub_counts,
-                                [src * N_RANKS + my_rank, prev_e],
-                            )
+                    src_e_off = pl.read(src_e_off_acc, [src])
                     for row in pl.range(n):
                         src_row = (
                             src_base
@@ -1097,6 +1175,11 @@ def _build_prefill_fwd_program(
                         sv = pl.read(recv_scale, [src_row, 0])
                         pl.write(local_routed_x_scale_out, [0, dst_row], sv)
                     running = running + pl.cast(n, pl.INT32)
+                    pl.write(
+                        src_e_off_acc, [src],
+                        pl.cast(src_e_off, pl.INT32)
+                        + pl.cast(n, pl.INT32),
+                    )
 
             return (
                 local_routed_x_out,
@@ -2936,6 +3019,7 @@ def _build_prefill_fwd_program(
                         [t_lo, 0],
                     )
 
+
             # Module dump 8: ffn_output (combined shared+routed MoE output,
             # pre-residual-add, TP-replicated).
             if _DUMP_ENABLED:
@@ -4552,7 +4636,7 @@ def _build_prefill_fwd_program(
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
-                    if moe_pos > 0:
+                    if moe_pos > 0 and PREFILL_SKIP_CROSS_FENCE == 0:
                         self.moe_cross_layer_fence(
                             pl.slice(
                                 moe_combine_done_sig,
@@ -4644,7 +4728,7 @@ def _build_prefill_fwd_program(
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
-                    if moe_pos > 0:
+                    if moe_pos > 0 and PREFILL_SKIP_CROSS_FENCE == 0:
                         self.moe_cross_layer_fence(
                             pl.slice(
                                 moe_combine_done_sig,
@@ -4744,7 +4828,7 @@ def _build_prefill_fwd_program(
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
-                    if moe_pos > 0:
+                    if moe_pos > 0 and PREFILL_SKIP_CROSS_FENCE == 0:
                         self.moe_cross_layer_fence(
                             pl.slice(
                                 moe_combine_done_sig,
@@ -4836,7 +4920,7 @@ def _build_prefill_fwd_program(
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
-                    if moe_pos > 0:
+                    if moe_pos > 0 and PREFILL_SKIP_CROSS_FENCE == 0:
                         self.moe_cross_layer_fence(
                             pl.slice(
                                 moe_combine_done_sig,

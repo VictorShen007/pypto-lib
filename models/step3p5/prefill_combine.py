@@ -50,6 +50,7 @@ from ._moe_constants import (
 __all__ = [
     "prefill_publish_src_route_table",
     "prefill_zero_routed_y_buf",
+    "prefill_zero_routed_y_buf_chunked",
     "prefill_push_routed_y_to_sources",
     "prefill_weighted_gather_and_add",
 ]
@@ -129,11 +130,39 @@ def prefill_zero_routed_y_buf(
     N_ROUTES_PER_RANK cells; any slot the combine push misses would
     otherwise read uninitialized ~5e4 garbage (mirrors decode
     moe.py:1838-1850 ``_zero_routed_y_buf``).
+
+    NOTE: keep this body branch-free — static ``if`` conditions inside an
+    inline body re-resolve in the SPLICING module's scope where the
+    defining module's names are invisible. Variant selection happens at
+    the ``pl.inline`` splice site in prefill_fwd.py instead.
     """
     for r in pl.range(N_ROUTES_PER_RANK):
         routed_y_buf[r : r + 1, :] = pl.full(
             [1, HIDDEN], dtype=pl.BF16, value=0.0,
         )
+
+    return routed_y_buf
+
+
+@pl.jit.inline
+def prefill_zero_routed_y_buf_chunked(
+    routed_y_buf: pld.DistributedTensor[
+        [N_ROUTES_PER_RANK, HIDDEN], pl.BF16
+    ],
+):
+    """Chunked-store variant of :func:`prefill_zero_routed_y_buf`.
+
+    Same buffer, same zero values, same windows -- only the store
+    granularity changes (R_CHUNK rows per store instead of 1, zero tile
+    constructed once). [R_CHUNK, 4096] BF16 = 64KB at R_CHUNK=8, inside
+    the per-core UB budget.
+    """
+    # NOTE: chunk size is a literal (4): cross-module constant resolution
+    # at splice time is unreliable for names first used inside a body.
+    zero_bf16 = pl.full([4, HIDDEN], dtype=pl.BF16, value=0.0)
+    for rc in pl.range(N_ROUTES_PER_RANK // 4):
+        r0 = rc * 4
+        routed_y_buf[r0 : r0 + 4, :] = zero_bf16
 
     return routed_y_buf
 

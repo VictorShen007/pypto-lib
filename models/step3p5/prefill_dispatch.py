@@ -41,12 +41,17 @@ from ._moe_constants import (
     TOPK,
 )
 
+# Rows per chunked zero-store in prefill_zero_dispatch_buffers_chunked.
+# Chosen so the cast-chain intermediates stay within the per-core UB
+# budget: [R_CHUNK, 4096] INT32 (64KB) + FP16 (32KB) + INT8 (16KB) at
+# R_CHUNK=4. Variant selection happens at the splice site (prefill_fwd).
 __all__ = [
     "prefill_histogram_and_prefix_sum",
     "prefill_pack_send_payload",
     "prefill_build_local_expert_csr",
     "prefill_build_inverse_map",
     "prefill_zero_dispatch_buffers",
+    "prefill_zero_dispatch_buffers_chunked",
 ]
 
 
@@ -77,6 +82,11 @@ def prefill_zero_dispatch_buffers(
     spliced into its OWN InCore step (NOT ``moe_dispatch_step``): the
     texpands+tstore loop trips pto-memory-consistency when inlined
     (ptoas 60s hang), same constraint as ``prefill_zero_routed_y_buf``.
+
+    NOTE: keep this body branch-free — static ``if`` conditions inside an
+    inline body re-resolve in the SPLICING module's scope where the
+    defining module's names are invisible. Variant selection happens at
+    the ``pl.inline`` splice site in prefill_fwd.py instead.
     """
     for r in pl.range(LOCAL_RECV_MAX):
         zero_i8 = pl.cast(
@@ -94,6 +104,46 @@ def prefill_zero_dispatch_buffers(
         recv_scale[r : r + 1, :] = pl.full(
             [1, SCALE_W_PAD], dtype=pl.FP32, value=0.0,
         )
+
+    return send_buf
+
+
+@pl.jit.inline
+def prefill_zero_dispatch_buffers_chunked(
+    send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+    send_scale_buf: pld.DistributedTensor[
+        [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+    ],
+    recv_x: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+    recv_scale: pld.DistributedTensor[
+        [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+    ],
+):
+    """Chunked-store variant of :func:`prefill_zero_dispatch_buffers`.
+
+    Same buffers, same zero values, same windows -- only the store
+    granularity changes (R_CHUNK rows per store instead of 1, zero tiles
+    constructed once). ~LOCAL_RECV_MAX/R_CHUNK-fold fewer
+    texpands+cast+tstore rounds. R_CHUNK=4 keeps the cast-chain
+    intermediates ([4,4096] INT32 64KB + FP16 32KB + INT8 16KB) inside the
+    ~184KB per-core UB budget.
+    """
+    # NOTE: chunk size is a literal (4): cross-module constant resolution
+    # at splice time is unreliable for names first used inside a body.
+    zero_i8 = pl.cast(
+        pl.cast(
+            pl.full([4, HIDDEN], dtype=pl.INT32, value=0),
+            target_type=pl.FP16, mode="round",
+        ),
+        target_type=pl.INT8, mode="trunc",
+    )
+    zero_f32 = pl.full([4, SCALE_W_PAD], dtype=pl.FP32, value=0.0)
+    for rc in pl.range(LOCAL_RECV_MAX // 4):
+        r0 = rc * 4
+        send_buf[r0 : r0 + 4, :] = zero_i8
+        recv_x[r0 : r0 + 4, :] = zero_i8
+        send_scale_buf[r0 : r0 + 4, :] = zero_f32
+        recv_scale[r0 : r0 + 4, :] = zero_f32
 
     return send_buf
 
@@ -226,6 +276,11 @@ def prefill_pack_send_payload(
             )
 
     for t in pl.range(BATCH):
+        # Load the token row ONCE per token (was once per (t,k) route:
+        # the same [1,HIDDEN]/[1,SCALE_W_PAD] tiles were re-loaded TOPK
+        # times inside the k loop). Stores and slot math unchanged.
+        x_tile = pl.load(x, [t, 0], [1, HIDDEN])
+        scale_tile = pl.load(x_scale, [t, 0], [1, SCALE_W_PAD])
         for k in pl.range(TOPK):
             eid = pl.read(indices, [t, k])
             dst = eid // N_LOCAL_EXPERTS
@@ -233,12 +288,10 @@ def prefill_pack_send_payload(
             bkt = dst * N_LOCAL_EXPERTS + loc_e
             slot_i32 = pl.read(cursor_per_bucket, [bkt])
             slot = pl.cast(slot_i32, pl.INDEX)
-            x_tile = pl.load(x, [t, 0], [1, HIDDEN])
             pl.store(x_tile, [slot, 0], send_buf)
             # Carry the per-token dequant scale alongside the INT8 activation.
             # Full SCALE_W_PAD-wide tile (col 0 = scale, cols 1..7 = pad)
             # keeps the a2a window's load/store tile 32B-aligned.
-            scale_tile = pl.load(x_scale, [t, 0], [1, SCALE_W_PAD])
             pl.store(scale_tile, [slot, 0], send_scale_buf)
             pl.write(
                 cursor_per_bucket, [bkt],
