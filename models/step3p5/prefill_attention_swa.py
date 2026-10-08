@@ -481,103 +481,105 @@ def attention_swa_prefill(
         k_norm_dump = pl.assemble(k_norm_dump, k_proj_norm, [0, 0])
 
     # ── Stage 1.g — full RoPE on Q and K (SWA: rotary_dim = HEAD_DIM). ─
-    for t in pl.parallel(PREFILL_T):
-        pos = pl.cast(pl.tensor.read(positions, [t]), pl.INDEX)
-        cos_row = pl.slice(rope_cos, [1, 128], [pos, 0])
-        sin_row = pl.slice(rope_sin, [1, 128], [pos, 0])
+    # pl.parallel(PREFILL_T) -> pl.spmd: the per-token tasks all wrote the same
+    # k_rot/v_tile/q_rot buffers at disjoint rows, but the dep graph keys on
+    # tensor_id without row offsets, serialising them into a WAW chain (pure
+    # false dependency). One SPMD kernel removes those inter-task edges. The
+    # per-token position scalar is named ``rope_pos`` (not ``pos``) so it stays
+    # body-local and does not leak into the spmd return tuple.
+    for t in pl.spmd(PREFILL_T, name_hint="prefill_swa_rope_q_k"):
+        rope_pos = pl.cast(pl.tensor.read(positions, [t]), pl.INDEX)
+        cos_row = pl.slice(rope_cos, [1, 128], [rope_pos, 0])
+        sin_row = pl.slice(rope_sin, [1, 128], [rope_pos, 0])
         cos_lo = pl.slice(cos_row, [1, 64], [0, 0])
         cos_hi = pl.slice(cos_row, [1, 64], [0, 64])
         sin_lo = pl.slice(sin_row, [1, 64], [0, 0])
         sin_hi = pl.slice(sin_row, [1, 64], [0, 64])
 
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="prefill_swa_rope_q_k",
-        ):
-            # K RoPE — single rank-local KV head per card under TP=8.
-            # SWA: rotary_pass = HEAD_DIM - ROTARY_DIM = 0 (full rotary).
-            for kh in pl.range(1):
-                k_col = kh * HEAD_DIM
-                k_lo = pl.slice(
-                    k_proj_norm, [1, 64], [t, k_col],
-                )
-                k_hi = pl.slice(
-                    k_proj_norm,
-                    [1, 64],
-                    [t, k_col + 64],
-                )
-                rot_k_lo = pl.sub(
-                    pl.col_expand_mul(k_lo, cos_lo),
-                    pl.col_expand_mul(k_hi, sin_lo),
-                )
-                rot_k_hi = pl.add(
-                    pl.col_expand_mul(k_hi, cos_hi),
-                    pl.col_expand_mul(k_lo, sin_hi),
-                )
-                k_rot = pl.assemble(
-                    k_rot,
-                    pl.cast(rot_k_lo, target_type=pl.BF16),
-                    [t, k_col],
-                )
-                k_rot = pl.assemble(
-                    k_rot,
-                    pl.cast(rot_k_hi, target_type=pl.BF16),
-                    [t, k_col + 64],
-                )
-                # V — copy through (no rotation).
-                v_slice = pl.slice(
-                    v_proj, [1, HEAD_DIM], [t, k_col],
-                )
-                v_tile = pl.assemble(
-                    v_tile,
-                    pl.cast(v_slice, target_type=pl.BF16),
-                    [t, k_col],
-                )
+        # K RoPE — single rank-local KV head per card under TP=8.
+        # SWA: rotary_pass = HEAD_DIM - ROTARY_DIM = 0 (full rotary).
+        for kh in pl.range(1):
+            k_col = kh * HEAD_DIM
+            k_lo = pl.slice(
+                k_proj_norm, [1, 64], [t, k_col],
+            )
+            k_hi = pl.slice(
+                k_proj_norm,
+                [1, 64],
+                [t, k_col + 64],
+            )
+            rot_k_lo = pl.sub(
+                pl.col_expand_mul(k_lo, cos_lo),
+                pl.col_expand_mul(k_hi, sin_lo),
+            )
+            rot_k_hi = pl.add(
+                pl.col_expand_mul(k_hi, cos_hi),
+                pl.col_expand_mul(k_lo, sin_hi),
+            )
+            k_rot = pl.assemble(
+                k_rot,
+                pl.cast(rot_k_lo, target_type=pl.BF16),
+                [t, k_col],
+            )
+            k_rot = pl.assemble(
+                k_rot,
+                pl.cast(rot_k_hi, target_type=pl.BF16),
+                [t, k_col + 64],
+            )
+            # V — copy through (no rotation).
+            v_slice = pl.slice(
+                v_proj, [1, HEAD_DIM], [t, k_col],
+            )
+            v_tile = pl.assemble(
+                v_tile,
+                pl.cast(v_slice, target_type=pl.BF16),
+                [t, k_col],
+            )
 
-            # Q RoPE — Q_PER_KV consecutive heads per KV-head bundle.
-            for kh in pl.range(1):
-                q_base_col = kh * 12 * HEAD_DIM
-                q_block_norm = pl.reshape(
-                    pl.slice(
-                        q_proj_norm,
-                        [1, 12 * HEAD_DIM], [t, q_base_col],
-                    ),
-                    [12, HEAD_DIM],
+        # Q RoPE — Q_PER_KV consecutive heads per KV-head bundle.
+        for kh in pl.range(1):
+            q_base_col = kh * 12 * HEAD_DIM
+            q_block_norm = pl.reshape(
+                pl.slice(
+                    q_proj_norm,
+                    [1, 12 * HEAD_DIM], [t, q_base_col],
+                ),
+                [12, HEAD_DIM],
+            )
+            q_lo = pl.slice(
+                q_block_norm, [12, 64], [0, 0],
+            )
+            q_hi = pl.slice(
+                q_block_norm,
+                [12, 64],
+                [0, 64],
+            )
+            rot_q_lo = pl.sub(
+                pl.col_expand_mul(q_lo, cos_lo),
+                pl.col_expand_mul(q_hi, sin_lo),
+            )
+            rot_q_hi = pl.add(
+                pl.col_expand_mul(q_hi, cos_hi),
+                pl.col_expand_mul(q_lo, sin_hi),
+            )
+            for qi in pl.range(12):
+                h_col = q_base_col + qi * HEAD_DIM
+                rl = pl.slice(
+                    rot_q_lo, [1, 64], [qi, 0],
                 )
-                q_lo = pl.slice(
-                    q_block_norm, [12, 64], [0, 0],
+                rh = pl.slice(
+                    rot_q_hi, [1, 64], [qi, 0],
                 )
-                q_hi = pl.slice(
-                    q_block_norm,
-                    [12, 64],
-                    [0, 64],
+                q_rot = pl.assemble(
+                    q_rot,
+                    pl.cast(rl, target_type=pl.BF16),
+                    [t, h_col],
                 )
-                rot_q_lo = pl.sub(
-                    pl.col_expand_mul(q_lo, cos_lo),
-                    pl.col_expand_mul(q_hi, sin_lo),
+                q_rot = pl.assemble(
+                    q_rot,
+                    pl.cast(rh, target_type=pl.BF16),
+                    [t, h_col + 64],
                 )
-                rot_q_hi = pl.add(
-                    pl.col_expand_mul(q_hi, cos_hi),
-                    pl.col_expand_mul(q_lo, sin_hi),
-                )
-                for qi in pl.range(12):
-                    h_col = q_base_col + qi * HEAD_DIM
-                    rl = pl.slice(
-                        rot_q_lo, [1, 64], [qi, 0],
-                    )
-                    rh = pl.slice(
-                        rot_q_hi, [1, 64], [qi, 0],
-                    )
-                    q_rot = pl.assemble(
-                        q_rot,
-                        pl.cast(rl, target_type=pl.BF16),
-                        [t, h_col],
-                    )
-                    q_rot = pl.assemble(
-                        q_rot,
-                        pl.cast(rh, target_type=pl.BF16),
-                        [t, h_col + 64],
-                    )
 
     # Module dump: k_rot (post-RoPE K) — matches golden kv_cache.k.
     if _DUMP_ENABLED:
@@ -613,18 +615,19 @@ def attention_swa_prefill(
     q_rot_padded = pl.create_tensor(
         [PREFILL_T * 16, HEAD_DIM], dtype=pl.BF16,
     )
-    for tp in pl.parallel(PREFILL_T):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_q_head_pad"):
-            q_rot_padded = pl.assemble(
-                q_rot_padded,
-                pl.slice(q_rot_flat, [12, HEAD_DIM], [tp * 12, 0]),
-                [tp * 16, 0],
-            )
-            q_rot_padded = pl.assemble(
-                q_rot_padded,
-                pl.full([4, HEAD_DIM], dtype=pl.BF16, value=0.0),
-                [tp * 16 + 12, 0],
-            )
+    # pl.parallel -> pl.spmd: same WAW false-dependency as rope_q_k (per-token
+    # tasks writing q_rot_padded at disjoint rows serialised into a chain).
+    for tp in pl.spmd(PREFILL_T, name_hint="prefill_swa_q_head_pad"):
+        q_rot_padded = pl.assemble(
+            q_rot_padded,
+            pl.slice(q_rot_flat, [12, HEAD_DIM], [tp * 12, 0]),
+            [tp * 16, 0],
+        )
+        q_rot_padded = pl.assemble(
+            q_rot_padded,
+            pl.full([4, HEAD_DIM], dtype=pl.BF16, value=0.0),
+            [tp * 16 + 12, 0],
+        )
 
     # The prior single-loop form carried the online-softmax running
     # max/sum/output through GM read-modify-write buffers (mi_buf/li_buf/
@@ -656,9 +659,12 @@ def attention_swa_prefill(
     )
 
     # Stage 1 — QK matmul + per-block softmax (pure map, disjoint writes).
-    for t in pl.parallel(PREFILL_T):
-        pos = pl.cast(pl.tensor.read(positions, [t]), pl.INDEX)
-        ctx_len_full = pos + 1
+    # pl.parallel -> pl.spmd: same WAW false-dependency as rope_q_k. Scalar
+    # renamed to ``faqk_pos`` (not ``pos``) so it stays body-local and does not
+    # leak into the spmd return tuple (which would misroute the assemble slice).
+    for t in pl.spmd(PREFILL_T, name_hint="prefill_swa_fa_qk"):
+        faqk_pos = pl.cast(pl.tensor.read(positions, [t]), pl.INDEX)
+        ctx_len_full = faqk_pos + 1
         start_pos = pl.max(
             pl.cast(0, pl.INDEX),
             pl.cast(ctx_len_full - 512, pl.INDEX),
@@ -677,104 +683,100 @@ def attention_swa_prefill(
                 pl.tensor.read(block_table, [bt_idx]), pl.INDEX,
             )
             cache_row0 = layer_cache_base + pbid * 128
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="prefill_swa_fa_qk",
-            ):
-                q_block = q_rot_padded[
-                    t * 16 : t * 16 + 16, 0 : HEAD_DIM,
-                ]
-                k_tile = pl.slice(
-                    k_cache, [128, HEAD_DIM], [cache_row0, 0],
-                )
-                raw_scores = pl.matmul(
-                    q_block, k_tile, b_trans=True, out_dtype=pl.FP32,
-                )
-                scores_scaled = pl.mul(raw_scores, 0.08838834764831845)
-                # The sliding window may start mid-block (start_pos > s0 for
-                # tokens past the window), so the valid columns within this KV
-                # block are [lo - s0, hi - s0), not [0, valid_len). Mask only
-                # the pad-head rows (12..16) via valid_shape + fillpad, then
-                # mask the out-of-window columns with a per-column bias
-                # (mirroring the decode-side SWA softmax). The bias is computed
-                # unconditionally: when the block is fully in-window
-                # (valid_len == 128) rel_lo=0 / rel_hi=128 give valid_mask=1,
-                # so invalid_bias is 0 and the add is a no-op. This avoids an
-                # if/else phi on `scores` whose col_major store layout (for the
-                # scores_dump assemble) would otherwise break trowmax.
-                scores_clipped = pl.slice(
-                    scores_scaled, [16, 128], [0, 0],
-                    valid_shape=[12, 128],
-                )
-                scores = pl.fillpad(
-                    scores_clipped, pad_value=pl.PadValue.min,
-                )
-                score_cols = pl.arange(0, [1, 128], dtype=pl.INT32)
-                zero_i32 = pl.const(0, pl.INT32)
-                one_i32 = pl.const(1, pl.INT32)
-                rel_lo = lo - s0
-                rel_hi = hi - s0
-                valid_from_i32 = pl.minimum(
-                    pl.maximum(
-                        pl.add(
-                            pl.sub(
-                                score_cols,
-                                pl.cast(rel_lo, pl.INT32),
-                            ),
-                            one_i32,
+            q_block = q_rot_padded[
+                t * 16 : t * 16 + 16, 0 : HEAD_DIM,
+            ]
+            k_tile = pl.slice(
+                k_cache, [128, HEAD_DIM], [cache_row0, 0],
+            )
+            raw_scores = pl.matmul(
+                q_block, k_tile, b_trans=True, out_dtype=pl.FP32,
+            )
+            scores_scaled = pl.mul(raw_scores, 0.08838834764831845)
+            # The sliding window may start mid-block (start_pos > s0 for
+            # tokens past the window), so the valid columns within this KV
+            # block are [lo - s0, hi - s0), not [0, valid_len). Mask only
+            # the pad-head rows (12..16) via valid_shape + fillpad, then
+            # mask the out-of-window columns with a per-column bias
+            # (mirroring the decode-side SWA softmax). The bias is computed
+            # unconditionally: when the block is fully in-window
+            # (valid_len == 128) rel_lo=0 / rel_hi=128 give valid_mask=1,
+            # so invalid_bias is 0 and the add is a no-op. This avoids an
+            # if/else phi on `scores` whose col_major store layout (for the
+            # scores_dump assemble) would otherwise break trowmax.
+            scores_clipped = pl.slice(
+                scores_scaled, [16, 128], [0, 0],
+                valid_shape=[12, 128],
+            )
+            scores = pl.fillpad(
+                scores_clipped, pad_value=pl.PadValue.min,
+            )
+            score_cols = pl.arange(0, [1, 128], dtype=pl.INT32)
+            zero_i32 = pl.const(0, pl.INT32)
+            one_i32 = pl.const(1, pl.INT32)
+            rel_lo = lo - s0
+            rel_hi = hi - s0
+            valid_from_i32 = pl.minimum(
+                pl.maximum(
+                    pl.add(
+                        pl.sub(
+                            score_cols,
+                            pl.cast(rel_lo, pl.INT32),
                         ),
-                        zero_i32,
+                        one_i32,
                     ),
-                    one_i32,
-                )
-                valid_to_i32 = pl.minimum(
-                    pl.maximum(
-                        pl.neg(
-                            pl.sub(
-                                score_cols,
-                                pl.cast(rel_hi, pl.INT32),
-                            ),
+                    zero_i32,
+                ),
+                one_i32,
+            )
+            valid_to_i32 = pl.minimum(
+                pl.maximum(
+                    pl.neg(
+                        pl.sub(
+                            score_cols,
+                            pl.cast(rel_hi, pl.INT32),
                         ),
-                        zero_i32,
                     ),
-                    one_i32,
+                    zero_i32,
+                ),
+                one_i32,
+            )
+            valid_mask = pl.cast(
+                pl.mul(valid_from_i32, valid_to_i32),
+                target_type=pl.FP32,
+            )
+            invalid_bias = pl.mul(
+                pl.sub(valid_mask, 1.0),
+                1.0e20,
+            )
+            scores = pl.col_expand_add(scores, invalid_bias)
+            if _DUMP_ENABLED:
+                scores_dump = pl.assemble(
+                    scores_dump, scores, [t * 16, 0],
                 )
-                valid_mask = pl.cast(
-                    pl.mul(valid_from_i32, valid_to_i32),
-                    target_type=pl.FP32,
-                )
-                invalid_bias = pl.mul(
-                    pl.sub(valid_mask, 1.0),
-                    1.0e20,
-                )
-                scores = pl.col_expand_add(scores, invalid_bias)
-                if _DUMP_ENABLED:
-                    scores_dump = pl.assemble(
-                        scores_dump, scores, [t * 16, 0],
-                    )
-                cur_mi = pl.row_max(scores)
-                exp_scores = pl.exp(
-                    pl.row_expand_sub(scores, cur_mi)
-                )
-                exp_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                cur_li = pl.row_sum(
-                    pl.cast(exp_bf16, target_type=pl.FP32)
-                )
-                scratch_row = t * MAX_CTX_BLOCKS + sb
-                all_cur_mi = pl.assemble(
-                    all_cur_mi,
-                    pl.reshape(cur_mi, [1, NUM_HEADS_SWA_LOCAL_PAD]),
-                    [scratch_row, 0],
-                )
-                all_cur_li = pl.assemble(
-                    all_cur_li,
-                    pl.reshape(cur_li, [1, NUM_HEADS_SWA_LOCAL_PAD]),
-                    [scratch_row, 0],
-                )
-                exp_base = scratch_row * NUM_HEADS_SWA_LOCAL_PAD
-                all_exp = pl.assemble(
-                    all_exp, exp_bf16, [exp_base, 0],
-                )
+            cur_mi = pl.row_max(scores)
+            exp_scores = pl.exp(
+                pl.row_expand_sub(scores, cur_mi)
+            )
+            exp_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+            cur_li = pl.row_sum(
+                pl.cast(exp_bf16, target_type=pl.FP32)
+            )
+            scratch_row = t * MAX_CTX_BLOCKS + sb
+            all_cur_mi = pl.assemble(
+                all_cur_mi,
+                pl.reshape(cur_mi, [1, NUM_HEADS_SWA_LOCAL_PAD]),
+                [scratch_row, 0],
+            )
+            all_cur_li = pl.assemble(
+                all_cur_li,
+                pl.reshape(cur_li, [1, NUM_HEADS_SWA_LOCAL_PAD]),
+                [scratch_row, 0],
+            )
+            exp_base = scratch_row * NUM_HEADS_SWA_LOCAL_PAD
+            all_exp = pl.assemble(
+                all_exp, exp_bf16, [exp_base, 0],
+            )
 
     # Stage 2 — online recurrence + normalize, intra-kernel per token.
     online_oi = pl.create_tensor(
