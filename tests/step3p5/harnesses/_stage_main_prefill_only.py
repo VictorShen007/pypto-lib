@@ -243,15 +243,18 @@ def _measure_one_length(args: argparse.Namespace, length: int) -> dict[str, Any]
             platform=args.platform,
         ).build()
 
-        prompt = [args.seed_token] * pad32
-        embedding = _load_embedding_rows(args.ckpt, prompt)
+        # Random synthetic hidden (matches _tmp_prefill_perf.py): diverse rows
+        # route tokens to different experts, unlike the all-same-token prompt.
+        g = torch.Generator().manual_seed(args.seed_token)
+        embedding = torch.randn(pad32, HIDDEN, generator=g).to(torch.bfloat16)
 
         with holder:
-            holder.set_prefill_input(embedding)
             for _ in range(max(0, args.ttft_warmup)):
+                holder.set_prefill_input(embedding)
                 holder.run()
             samples: list[float] = []
             for _ in range(max(1, args.ttft_iters)):
+                holder.set_prefill_input(embedding)
                 started = time.time()
                 holder.run()
                 samples.append(time.time() - started)
