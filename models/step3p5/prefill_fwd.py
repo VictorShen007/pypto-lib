@@ -100,6 +100,17 @@ import pypto.language.distributed as pld
 #     edge stays declared; only in-task dummy loads shrink ~512x).
 PREFILL_ZERO_CHUNK = int(_os.environ.get("PYPTO_PREFILL_ZERO_CHUNK", "4"))  # default 4 (chunked) per zero_chunk4 A/B: P50 -8.8% vs per-row
 PREFILL_SER_MODE = int(_os.environ.get("PYPTO_PREFILL_SER_MODE", "1"))  # 默认 1（2026-09-23 A/B 定案：ser=1 vs ser=0 同代码同日 -527ms/−13.8%，cos 0.9959 过门）
+#   PREFILL_A2A_BULK: ep_all_to_all copy granularity (audit A1, 2026-10-08).
+#     0 = original per-row copies (128 rows x 7 peers of [1, HIDDEN] tiles =
+#     ~3.6k serial GM/remote ops per dispatch); 1 = bulk chunked copies
+#     ([PREFILL_A2A_ROWS, HIDDEN] tiles = 14-56 ops). Copies the SAME rows
+#     (full fixed-slot block incl. the zeroed gap rows, which the per-row
+#     form also copies and downstream ignores) -> bit-identical results;
+#     only loop granularity changes.
+#   PREFILL_A2A_ROWS: rows per bulk tile. UB bound: ROWS*4096 B INT8 payload
+#     + ROWS*32 B FP32 scale (16 -> 64 KB of the 184 KB Vec buffer).
+PREFILL_A2A_BULK = int(_os.environ.get("PYPTO_PREFILL_A2A_BULK", "0"))
+PREFILL_A2A_ROWS = int(_os.environ.get("PYPTO_PREFILL_A2A_ROWS", "16"))
 # MEASUREMENT-ONLY PROBE (UNSAFE, never ship): skip the cross-layer WAR
 # fence to test whether it is on the critical path. Skipping can race
 # layer L's dispatch against layer L-1's combine drains.
@@ -280,6 +291,14 @@ PREFILL_TILE_COUNT = PREFILL_T // BATCH
 assert PREFILL_T % BATCH == 0, (
     f"PREFILL_T={PREFILL_T} must be a multiple of BATCH={BATCH} so the "
     "inlined prefill-T MoE adapter can chunk into whole decode-T tiles"
+)
+assert (
+    (BATCH * TOPK) % PREFILL_A2A_ROWS == 0 and 0 < PREFILL_A2A_ROWS <= 32
+), (
+    f"PREFILL_A2A_ROWS={PREFILL_A2A_ROWS} must divide BATCH*TOPK="
+    f"{BATCH * TOPK} and stay <= 32 so the ep_all_to_all_bulk tile "
+    f"[{PREFILL_A2A_ROWS}, {HIDDEN}] INT8 ("
+    f"{PREFILL_A2A_ROWS * HIDDEN // 1024} KB) fits the UB budget"
 )
 
 
@@ -471,6 +490,223 @@ _VALID_LAYER_KINDS = frozenset(
 )
 
 
+# ── EP all-to-all bodies (module-level @pl.jit.inline). ──
+# Pulled out of the Step3p5PrefillFwd class (they were Inline methods there)
+# so the per-row and bulk-chunked variants can be selected at factory scope
+# with a plain Python if/else (the ZERO_CHUNK idiom below). A device-level
+# ``if`` inside moe_dispatch_step is NOT viable: both branches get inlined
+# into the IfStmt region where body-local aliases in shape positions turn
+# into dynamic IR Scalars and InitMemRef rejects them — the lh45 BULK=0 arm
+# failed on the ORIGINAL body's [1, d_cols] this way (smokes 1-4, 2026-10-08).
+# Shape dims here are therefore bare module constants; range bounds and
+# offsets may stay dynamic.
+@pl.jit.inline
+def prefill_ep_all_to_all(
+    send: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+    recv: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+    send_scale: pld.DistributedTensor[
+        [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+    ],
+    recv_scale: pld.DistributedTensor[
+        [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+    ],
+    send_counts: pl.Tensor[[N_RANKS], pl.INT32],
+    recv_counts: pl.Tensor[[N_RANKS], pl.INT32],
+    send_offsets: pl.Tensor[[N_RANKS], pl.INT32],
+    recv_offsets: pl.Tensor[[N_RANKS], pl.INT32],
+    signal_window: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Pull-side fixed-slot token-level all-to-all over the EP group.
+
+    Lifted verbatim from the original ``Step3p5PrefillFwd.ep_all_to_all``
+    (itself from prefill_moe.py:323-384: Set signal + Ge wait, one signal
+    round-trip for the data-arrival handshake). The only body edit is
+    ``[1, d_cols]`` -> ``[1, HIDDEN]`` (shape dims must be bare constants,
+    see the block comment above).
+    """
+    group_size = N_RANKS
+
+    # Symmetric fixed-slot a2a (§D:129, mirrors decode moe.py:316-409).
+    # Each (src,dst) pair owns a full BATCH*TOPK slot block; the
+    # dst-side pack writes at dst*BATCH*TOPK and the src-side read
+    # pulls from my_rank*BATCH*TOPK, so no per-rank offset tensor is
+    # needed (the old variable-length recv_offsets read had the
+    # Problem-27 src/dst prefix-sum skew). send_counts/recv_counts/
+    # send_offsets/recv_offsets become unused formals (kept for
+    # signature parity, same as decode).
+    PER_PEER_BOUND = BATCH * TOPK
+
+    # 1) Local self-bucket copy (symmetric fixed slot my_rank*MAX).
+    self_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
+    for r in pl.range(PER_PEER_BOUND):
+        self_tile = pl.load(send, [self_base + r, 0], [1, HIDDEN])
+        pl.store(self_tile, [self_base + r, 0], recv)
+        # Fused per-token dequant scale self-copy (same row index,
+        # SCALE_W_PAD-wide tile — mirrors decode moe.py:354-358).
+        s_self = pl.load(
+            send_scale, [self_base + r, 0], [1, SCALE_W_PAD],
+        )
+        pl.store(s_self, [self_base + r, 0], recv_scale)
+
+    # 2) AtomicAdd(1) notify every peer (EP barrier signal, §D:129).
+    for peer in pl.range(group_size):
+        if peer != my_rank:
+            pld.system.notify(
+                target=signal_window,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.AtomicAdd,
+            )
+
+    # 3) Ge(1) wait for every peer.
+    for src in pl.range(group_size):
+        if src != my_rank:
+            pld.system.wait(
+                signal=signal_window,
+                offsets=[src, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    # 4) Pull every peer's bucket-for-me (symmetric fixed slots).
+    #    My block in peer's send_buf is at my_rank*MAX; store into
+    #    peer's block in my recv at peer*MAX. Read the full MAX rows
+    #    (gap rows past the real count are ignored by the re-pack,
+    #    which uses the per-(src,e) counts).
+    my_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
+    for peer in pl.range(group_size):
+        if peer != my_rank:
+            peer_base = pl.cast(peer * PER_PEER_BOUND, pl.INDEX)
+            for r in pl.range(PER_PEER_BOUND):
+                peer_tile = pld.tile.remote_load(
+                    send,
+                    peer=peer,
+                    offsets=[my_base + r, 0],
+                    shape=[1, HIDDEN],
+                )
+                pl.store(peer_tile, [peer_base + r, 0], recv)
+                # Fused scale pull: same peer/row, SCALE_W_PAD-wide tile
+                # (mirrors decode moe.py:401-407).
+                s_peer = pld.tile.remote_load(
+                    send_scale,
+                    peer=peer,
+                    offsets=[my_base + r, 0],
+                    shape=[1, SCALE_W_PAD],
+                )
+                pl.store(s_peer, [peer_base + r, 0], recv_scale)
+
+    return recv
+
+
+@pl.jit.inline
+def prefill_ep_all_to_all_bulk(
+    send: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+    recv: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+    send_scale: pld.DistributedTensor[
+        [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+    ],
+    recv_scale: pld.DistributedTensor[
+        [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+    ],
+    send_counts: pl.Tensor[[N_RANKS], pl.INT32],
+    recv_counts: pl.Tensor[[N_RANKS], pl.INT32],
+    send_offsets: pl.Tensor[[N_RANKS], pl.INT32],
+    recv_offsets: pl.Tensor[[N_RANKS], pl.INT32],
+    signal_window: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Bulk-chunked variant of :func:`prefill_ep_all_to_all` (audit A1).
+
+    Byte-identical semantics (same rows copied in the same order, same
+    barrier placement) — only the copy granularity changes:
+    [PREFILL_A2A_ROWS, HIDDEN] tiles instead of per-row [1, HIDDEN]. Legal
+    because the fixed-slot layout makes every (peer, my_rank-block) segment
+    contiguous (pack writes each dst block as a bucket-contiguous t-major
+    prefix), and the gap rows past the real counts are zero-filled by
+    zero_dispatch_buffers_step and ignored downstream — the per-row form
+    copies them too, so the bulk form is bit-exact. Audit A1
+    (performance/RESULT_NEW2.md §二): the per-row form issues 7*128 payload
+    + 7*128 scale remote ops per dispatch (~1.65M/forward) and dominates
+    the measured 1.853 ms moe_dispatch_step instance; the bulk form issues
+    7*(128/ROWS)*2 = 112 ops at ROWS=16. The count/offset formals stay
+    unused for signature parity with the per-row body.
+    """
+    group_size = N_RANKS
+    # Same symmetric fixed-slot a2a as prefill_ep_all_to_all (§D:129).
+    PER_PEER_BOUND = BATCH * TOPK
+    # NOTE: shape dims must be bare module constants here (HIDDEN /
+    # SCALE_W_PAD / PREFILL_A2A_ROWS), same rule as the literal 4 in
+    # prefill_zero_dispatch_buffers_chunked: body-local aliases
+    # (`d_cols = HIDDEN`, `chunk_rows = PREFILL_A2A_ROWS`) turn the
+    # shape element into a dynamic IR Scalar and break InitMemRef
+    # (lh8 smokes 2-4, 2026-10-08). Range bounds and offsets may stay
+    # dynamic, so the PER_PEER_BOUND alias above is fine.
+    self_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
+
+    # 1) Local self-bucket copy, chunked.
+    for r0 in pl.range(0, PER_PEER_BOUND, PREFILL_A2A_ROWS):
+        self_tile = pl.load(
+            send, [self_base + r0, 0], [PREFILL_A2A_ROWS, HIDDEN],
+        )
+        pl.store(self_tile, [self_base + r0, 0], recv)
+        # Fused per-token dequant scale self-copy (same rows,
+        # SCALE_W_PAD-wide tile — mirrors step 1 above).
+        s_self = pl.load(
+            send_scale, [self_base + r0, 0],
+            [PREFILL_A2A_ROWS, SCALE_W_PAD],
+        )
+        pl.store(s_self, [self_base + r0, 0], recv_scale)
+
+    # 2) AtomicAdd(1) notify every peer (EP barrier, unchanged).
+    for peer in pl.range(group_size):
+        if peer != my_rank:
+            pld.system.notify(
+                target=signal_window,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.AtomicAdd,
+            )
+
+    # 3) Ge(1) wait for every peer (unchanged).
+    for src in pl.range(group_size):
+        if src != my_rank:
+            pld.system.wait(
+                signal=signal_window,
+                offsets=[src, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    # 4) Pull every peer's bucket-for-me, chunked bulk tiles.
+    #    My block in peer's send_buf is at my_rank*PER_PEER_BOUND;
+    #    store into peer's block in my recv at peer*PER_PEER_BOUND.
+    my_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
+    for peer in pl.range(group_size):
+        if peer != my_rank:
+            peer_base = pl.cast(peer * PER_PEER_BOUND, pl.INDEX)
+            for r0 in pl.range(0, PER_PEER_BOUND, PREFILL_A2A_ROWS):
+                peer_tile = pld.tile.remote_load(
+                    send,
+                    peer=peer,
+                    offsets=[my_base + r0, 0],
+                    shape=[PREFILL_A2A_ROWS, HIDDEN],
+                )
+                pl.store(peer_tile, [peer_base + r0, 0], recv)
+                # Fused scale pull, chunked (mirrors step 4 above).
+                s_peer = pld.tile.remote_load(
+                    send_scale,
+                    peer=peer,
+                    offsets=[my_base + r0, 0],
+                    shape=[PREFILL_A2A_ROWS, SCALE_W_PAD],
+                )
+                pl.store(s_peer, [peer_base + r0, 0], recv_scale)
+
+    return recv
+
+
 # =============================================================================
 # Top-level @pl.program — Step3p5PrefillFwd.
 # =============================================================================
@@ -564,6 +800,15 @@ def _build_prefill_fwd_program(
         zero_routed_inline = pl.inline(prefill_zero_routed_y_buf_chunked._func)
     push_routed_inline = pl.inline(prefill_push_routed_y_to_sources._func)
     gather_add_inline = pl.inline(prefill_weighted_gather_and_add._func)
+    # EP a2a variant selection (audit A1, env-gated like ZERO_CHUNK): plain
+    # Python if/else at factory scope binds ONE name; moe_dispatch_step calls
+    # ``ep_a2a_inline(...)`` (parse-time splice, no device branch — see the
+    # block comment above prefill_ep_all_to_all for why a device-level if is
+    # not viable).
+    if PREFILL_A2A_BULK == 1:
+        ep_a2a_inline = pl.inline(prefill_ep_all_to_all_bulk._func)
+    else:
+        ep_a2a_inline = pl.inline(prefill_ep_all_to_all._func)
 
     @pl.program
     class Step3p5PrefillFwd:
@@ -861,108 +1106,6 @@ def _build_prefill_fwd_program(
                 pl.store(s, [b, 0], x_scale_out)
             return x_scale_out
 
-        # ── EP all-to-all (Inline). ──
-        # Pull-side variable-length token-level all-to-all over the EP group.
-        # Lifted verbatim from prefill_moe.py:323-384 (Set signal + Ge wait,
-        # one signal round-trip for the data-arrival handshake). Inline (not
-        # InCore) so the InCore ``moe_dispatch_step`` can call it via
-        # ``self.`` — InCore functions may call Inline methods but not other
-        # InCore functions (decode moe.py:316 ep_all_to_all is Inline).
-        @pl.function(type=pl.FunctionType.Inline)
-        def ep_all_to_all(
-            self,
-            send: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
-            recv: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
-            send_scale: pld.DistributedTensor[
-                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
-            ],
-            recv_scale: pld.DistributedTensor[
-                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
-            ],
-            send_counts: pl.Tensor[[N_RANKS], pl.INT32],
-            recv_counts: pl.Tensor[[N_RANKS], pl.INT32],
-            send_offsets: pl.Tensor[[N_RANKS], pl.INT32],
-            recv_offsets: pl.Tensor[[N_RANKS], pl.INT32],
-            signal_window: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-            my_rank: pl.Scalar[pl.INT32],
-        ) -> pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8]:
-            group_size = N_RANKS
-            d_cols = HIDDEN
-
-            # Symmetric fixed-slot a2a (§D:129, mirrors decode moe.py:316-409).
-            # Each (src,dst) pair owns a full BATCH*TOPK slot block; the
-            # dst-side pack writes at dst*BATCH*TOPK and the src-side read
-            # pulls from my_rank*BATCH*TOPK, so no per-rank offset tensor is
-            # needed (the old variable-length recv_offsets read had the
-            # Problem-27 src/dst prefix-sum skew). send_counts/recv_counts/
-            # send_offsets/recv_offsets become unused formals (kept for
-            # signature parity, same as decode).
-            PER_PEER_BOUND = BATCH * TOPK
-
-            # 1) Local self-bucket copy (symmetric fixed slot my_rank*MAX).
-            self_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
-            for r in pl.range(PER_PEER_BOUND):
-                self_tile = pl.load(
-                    send, [self_base + r, 0], [1, d_cols],
-                )
-                pl.store(self_tile, [self_base + r, 0], recv)
-                # Fused per-token dequant scale self-copy (same row index,
-                # SCALE_W_PAD-wide tile — mirrors decode moe.py:354-358).
-                s_self = pl.load(
-                    send_scale, [self_base + r, 0], [1, SCALE_W_PAD],
-                )
-                pl.store(s_self, [self_base + r, 0], recv_scale)
-
-            # 2) AtomicAdd(1) notify every peer (EP barrier signal, §D:129).
-            for peer in pl.range(group_size):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=signal_window,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.AtomicAdd,
-                    )
-
-            # 3) Ge(1) wait for every peer.
-            for src in pl.range(group_size):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=signal_window,
-                        offsets=[src, 0],
-                        expected=1,
-                        cmp=pld.WaitCmp.Ge,
-                    )
-
-            # 4) Pull every peer's bucket-for-me (symmetric fixed slots).
-            #    My block in peer's send_buf is at my_rank*MAX; store into
-            #    peer's block in my recv at peer*MAX. Read the full MAX rows
-            #    (gap rows past the real count are ignored by the re-pack,
-            #    which uses the per-(src,e) counts).
-            my_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
-            for peer in pl.range(group_size):
-                if peer != my_rank:
-                    peer_base = pl.cast(peer * PER_PEER_BOUND, pl.INDEX)
-                    for r in pl.range(PER_PEER_BOUND):
-                        peer_tile = pld.tile.remote_load(
-                            send,
-                            peer=peer,
-                            offsets=[my_base + r, 0],
-                            shape=[1, d_cols],
-                        )
-                        pl.store(peer_tile, [peer_base + r, 0], recv)
-                        # Fused scale pull: same peer/row, SCALE_W_PAD-wide tile
-                        # (mirrors decode moe.py:401-407).
-                        s_peer = pld.tile.remote_load(
-                            send_scale,
-                            peer=peer,
-                            offsets=[my_base + r, 0],
-                            shape=[1, SCALE_W_PAD],
-                        )
-                        pl.store(s_peer, [peer_base + r, 0], recv_scale)
-
-            return recv
-
         # ── MoE dispatch / combine glue (InCore). ──
         # The per-tile EP dispatch (histogram -> publish pub_counts ->
         # count_done barrier -> pack send payload -> recv_counts/offsets ->
@@ -1125,7 +1268,9 @@ def _build_prefill_fwd_program(
                     pl.cast(prev_off + prev_cnt, pl.INT32),
                 )
 
-            self.ep_all_to_all(
+            # EP all-to-all (variant bound at factory scope per
+            # PYPTO_PREFILL_A2A_BULK: per-row default, bulk-chunked =1).
+            ep_a2a_inline(
                 send_buf, recv_x, send_scale_buf, recv_scale,
                 send_counts_rank, recv_counts,
                 send_offsets_rank, recv_offsets,
