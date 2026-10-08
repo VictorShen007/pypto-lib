@@ -60,7 +60,7 @@ def _start_exporters(out: Path, devices: list[int], ckpt: str):
             path.unlink(missing_ok=True)
     (out / "STOP").unlink(missing_ok=True)
 
-    root = Path("/data/shenwx/pypto_jy/pypto-lib")
+    root = Path(__file__).resolve().parents[3]  # pypto-lib repo root (this clone)
     procs = []
 
     def launch(rank, dev):

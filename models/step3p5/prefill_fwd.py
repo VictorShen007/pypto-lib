@@ -98,7 +98,7 @@ import pypto.language.distributed as pld
 #   PREFILL_SER_MODE: _serialize_after_shared dependency-carrier size.
 #     0 = original full-row fold; 1 = one 32B chunk per row (the sh_y task
 #     edge stays declared; only in-task dummy loads shrink ~512x).
-PREFILL_ZERO_CHUNK = int(_os.environ.get("PYPTO_PREFILL_ZERO_CHUNK", "1"))
+PREFILL_ZERO_CHUNK = int(_os.environ.get("PYPTO_PREFILL_ZERO_CHUNK", "4"))  # default 4 (chunked) per zero_chunk4 A/B: P50 -8.8% vs per-row
 PREFILL_SER_MODE = int(_os.environ.get("PYPTO_PREFILL_SER_MODE", "1"))  # 默认 1（2026-09-23 A/B 定案：ser=1 vs ser=0 同代码同日 -527ms/−13.8%，cos 0.9959 过门）
 # MEASUREMENT-ONLY PROBE (UNSAFE, never ship): skip the cross-layer WAR
 # fence to test whether it is on the critical path. Skipping can race
