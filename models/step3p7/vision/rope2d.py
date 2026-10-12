@@ -13,7 +13,7 @@ in halves; full-head_dim ``rotate_half`` applied with cos/sin whose first half
 encodes width-grid freqs and second half height-grid freqs.
 
 ``build_2d_rope_tables`` is also consumed by the L3 driver
-(``tools/step3p7/run_l3_e2e.py``). The ``@pl.jit`` test wrapper + specs +
+(``models/step3p7/vision/vision_fwd_repl_os.py``). The ``@pl.jit`` test wrapper + specs +
 golden adapter + driver live in ``tests/step3p7/unit/test_rope2d.py``.
 """
 

@@ -59,7 +59,7 @@
 # N=128 tile set blew the 184KB Vec wall: 190.1KB rejected in the m64 probe).
 # Un-fused, the GEMM's Vec usage drops to ZERO and N=128 becomes expressible
 # (Right/L0B = [128,128]x2Bx2 stages = 64KB = exactly the wall). FP_N=128
-# fixed after the device A/B (harness run_l3_e2e_repl, active=6,
+# fixed after the device A/B (harness vision_fwd_repl_os, active=6,
 # strace device_wall): flat6 fused 1027.1ms -> fixpipe@128 918.6ms (-10.6%);
 # fixpipe@64 was neutral (1035.9 median) — the win is N=128 itself, the
 # un-fuse alone does not pay. Numerics: L0 single-layer tight gate

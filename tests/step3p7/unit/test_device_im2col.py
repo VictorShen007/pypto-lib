@@ -17,7 +17,7 @@ locks in the MATH invariant (dim-agnostic, so small dims are used to stay fast):
     tap-major gather @ permuted weight  ==  channel-major F.unfold @ original weight
 
 The full-dim device correctness is covered end-to-end by
-``tools/step3p7/run_vision_full.py`` (Stage 5/6 ISOLATION vs vLLM golden).
+``models/step3p7/vision/vision_full_fwd.py`` (Stage 5/6 ISOLATION vs vLLM golden).
 
 Usage::
 

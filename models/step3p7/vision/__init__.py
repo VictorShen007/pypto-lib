@@ -10,7 +10,9 @@
 
 Everything in this subpackage is the vision side of step3p7 (the
 PerceptionEncoder + 6144->4096 projector). The step3p7 *language model* is
-NOT here — it is reused from ``models/step3p5``. Top-level ``models/step3p7``
+NOT here — it is reused from ``models/step3p5``. Each ``*_fwd.py`` module is
+self-contained — kernel + spec builders + host driver ``main()`` + ``__main__``
+— mirroring DeepSeek's ``decode_fwd.py`` layout; top-level ``models/step3p7``
 holds only the integration glue that wires vision output into the LM.
 
 Naming: ``vision_config.py`` / ``vision_weight_loader.py`` carry the

@@ -14,7 +14,7 @@ layout [g*g, c] -> padded [g+2 x g+2, c] with interior token (ih,iw) landing at
 (ih+1, iw+1), and the 4 border edges explicitly zeroed (the scratch is NOT
 zero-initialized). This test locks in the INDEX MATH (dim-agnostic, small dims to
 stay fast) against the torch ``F.pad`` ground truth. The full-dim device
-correctness is covered end-to-end by ``tools/step3p7/run_vision_full.py``
+correctness is covered end-to-end by ``models/step3p7/vision/vision_full_fwd.py``
 (Stage 5/6 ISOLATION vs vLLM golden).
 
 The reference mirrors the kernel's explicit loops (interior gather + per-edge

@@ -54,7 +54,7 @@ def _test_mock_all_gather_rows():
 
 def _test_shard_by_rank():
     import torch
-    from tools.step3p7.run_vision_full import _shard_by_rank
+    from models.step3p7.vision.vision_full_fwd import _shard_by_rank
 
     images = torch.arange(16).reshape(8, 2)  # 8 images of 2 elems
     assert torch.equal(_shard_by_rank(images, 0, 1), images[0:1])

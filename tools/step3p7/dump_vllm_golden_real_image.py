@@ -147,10 +147,10 @@ class Dumper:
     """Forward-hook dump collector; mode controls the B-axis convention.
 
     global: single-image forward, B=1 squeezed away (matches the serve-format
-            golden/ dir consumed by run_vision_full.py).
+            golden/ dir consumed by vision_full_fwd.py).
     patch:  batch-of-crops forward, B dim kept ([N, ...] per-crop tensors with
             N = this image's crop count, matching golden_permodule_patch/
-            consumed by run_vision_full_patch.py).
+            consumed by vision_full_fwd_patch.py).
     """
 
     def __init__(self, out_dir: Path, mode: str):
@@ -165,7 +165,7 @@ class Dumper:
         if not torch.is_tensor(t):
             return
         # patch mode: keep the serve-format "patch_*" file names the pypto
-        # patch driver (run_vision_full_patch.py) expects for shared hook
+        # patch driver (vision_full_fwd_patch.py) expects for shared hook
         # tensors (patch_layer_00_layer_input / patch_downsampler*_out);
         # patch_model_input / patch_tower_out are already prefixed.
         if self.mode == "patch" and not name.startswith("patch_"):

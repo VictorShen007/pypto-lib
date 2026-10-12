@@ -16,8 +16,11 @@ Package layout (split so readers can tell vision apart from the LM):
   ``rope2d`` prefix or are otherwise unambiguously vision. The vision config
   is ``vision/vision_config.py`` and vision weights load via
   ``vision/vision_weight_loader.py`` (``vision_`` prefix avoids collision with
-  the step3p5 LM's ``config.py`` / ``weight_loader.py``).
-- ``models/step3p7/`` (this top level) — reserved for the *integration glue*
+  the step3p5 LM's ``config.py`` / ``weight_loader.py``). Each ``*_fwd.py``
+  module is self-contained — kernel + spec builders + host driver ``main()`` +
+  ``__main__`` — mirroring DeepSeek's ``decode_fwd.py`` layout, so the vision
+  e2e drivers live here (not at the package top level).
+- ``models/step3p7/`` (this top level) — space reserved for the *integration glue*
   that wires vision output (image_features) into the step3p5 LM
   (holder scatter, combined VIT+LM program, etc.).
 - The step3p7 *language model* is **not** re-implemented here; it is reused
