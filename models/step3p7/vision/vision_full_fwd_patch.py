@@ -11,9 +11,11 @@
 The patch path (6 x 504^2 local crops) reuses the SAME conv/ln/projector
 weights as the global path (one PerceptionEncoder; vLLM ``vision_encoder.py``
 ``forward`` runs conv1 -> +interp(posemb) -> ln_pre -> transformer for each
-crop). The 47-layer patch TOWER is in ``vision_fwd_patch.py``
-(``Step3p7VisionPatch``); this module holds the front (patch_embed/ln_pre) and
-back (ds1/ds2/projector) stages that chain around it.
+crop). The 47-layer patch TOWER is the replicated (REPL) flat/flat6 tower
+(``vision_fwd_patch_repl_os_flat.py`` / ``vision_fwd_patch_repl_os_flat6.py``,
+REPL host_orch contract from ``vision_fwd_repl_os.py``); this module holds the
+front (patch_embed/ln_pre) and back (ds1/ds2/projector) stages that chain
+around it.
 
 Design — per-crop host-loop, single-sequence replicated @pl.programs:
   Each stage is an 8-card replicated @pl.program (mirror of the global

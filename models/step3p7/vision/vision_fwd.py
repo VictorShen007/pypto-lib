@@ -78,7 +78,7 @@ def vb2_all(qkv_full:pl.Tensor[[vT,KO],pl.BF16],cos:pl.Tensor[[vT,HD],pl.FP32],s
         # Zero-fill the per-head pad columns (HD..HDP): v2f's PV matmul reads
         # the full [KT,HDP] slice, and unwritten pads read arena garbage —
         # stale NaN bits on repeated dispatches propagate NaN*0=NaN through
-        # vb3's K-dim read (BUG-0002; same fix in vision_fwd_patch.py).
+        # vb3's K-dim read (BUG-0002).
         vp=pl.assemble(vp,pl.full([QT,HDP-HD],dtype=pl.BF16,value=0.0),[qg,hv0+HD])
     # v2g: global per-row max of scaled scores (running max over wide QK).
     for gm in pl.spmd(nq*HL,name_hint='v2g'):

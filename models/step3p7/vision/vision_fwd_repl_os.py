@@ -910,15 +910,11 @@ def main():
                         "the selected tower/chunk/active program shape)")
     p.add_argument("--no-golden", action="store_true", default=False,
                    help="perf-only: skip golden load + validation (bench timing only)")
-    p.add_argument("--tower", default="os", choices=["os", "osfa", "osfaslot", "osfixpipe", "osmlpf1", "osn256", "osmdec", "qkpv"],
-                   help="global-tower program: os = production online-softmax tower; "
-                        "the rest (osfa, osfaslot, osfixpipe, osmlpf1, osn256, osmdec, "
-                        "qkpv) are retired experiment drafts")
-    p.add_argument("--patch-tower", default="flat6", choices=["flat6", "fixpipe", "v1g128", "n256", "n256f1", "f1", "flat", "n256qkv", "n512", "patchmdec"],
+    p.add_argument("--tower", default="os", choices=["os"],
+                   help="global-tower program: os = production online-softmax tower")
+    p.add_argument("--patch-tower", default="flat6", choices=["flat6", "flat"],
                    help="patch-tower program: flat6 = production VB=6 active-only flat "
-                        "attention; flat = VB=16 capacity + runtime active scalar; the "
-                        "rest (fixpipe, v1g128, n256, n256f1, f1, n256qkv, n512, "
-                        "patchmdec) are retired experiment drafts")
+                        "attention; flat = VB=16 capacity + runtime active scalar")
     args = p.parse_args()
 
     layer = args.layer if args.layer >= 0 else None
@@ -935,101 +931,16 @@ def main():
         # flat6 only matches the exactly-6-crop patch path — any other count
         # falls back to flat.
         _patch_tower = args.patch_tower
-        if _patch_tower == "fixpipe" and args.active != 6:
-            p.error(f"--patch-tower fixpipe requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "v1g128" and args.active != 6:
-            p.error(f"--patch-tower v1g128 requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "n256" and args.active != 6:
-            p.error(f"--patch-tower n256 requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "n256f1" and args.active != 6:
-            p.error(f"--patch-tower n256f1 requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "f1" and args.active != 6:
-            p.error(f"--patch-tower f1 requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "n256qkv" and args.active != 6:
-            p.error(f"--patch-tower n256qkv requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "n512" and args.active != 6:
-            p.error(f"--patch-tower n512 requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
-        if _patch_tower == "patchmdec" and args.active != 6:
-            p.error(f"--patch-tower patchmdec requires --active 6 "
-                    f"(VB=6 specialization; got active={args.active})")
         if _patch_tower == "flat6" and args.active != 6:
             print(f"[l3repl] patch-tower {_patch_tower} requires --active 6; "
                   f"falling back to flat (VB={V_PATCH_BATCH}) for active={args.active}")
             _patch_tower = "flat"
-        if _patch_tower == "fixpipe":
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_fixpipe_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "v1g128":
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_v1g128_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "n256":
-            # FP_N comes from the PYPTO_FP_N env (module-level read); FP_KC
-            # derives to 64 for FP_N>128.
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_n256_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "n256f1":
-            # n256 + promoted mlp_f1 FixPipe split; FP_N env drives both.
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_n256f1_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "f1":
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_f1_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "n256qkv":
-            # QKN_Q comes from the PYPTO_V1G_N env (module-level read);
-            # QKK_Q derives to 64 for QKN_Q>128.
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_n256qkv_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "n512":
-            # flat6 production + PYPTO_FP_N (v3g/v4g/v4ag ladder, elementwise
-            # passes stay RES_N<=256) + PYPTO_V1G_N (v1g) env knobs; defaults
-            # 256/256 = production semantics (anchor), target 512/512.
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_n512_draft import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-            )
-        elif _patch_tower == "flat6":
+        if _patch_tower == "flat6":
             # GEMM-M-decoupling promoted into flat6: the four
             # FixPipe GEMMs run MQ_G=128, so the tower's baked RoPE/GEMM
             # stride is vTp=1408 — the driver must pad cos/sin to it.
             patch_vb = 6
             from models.step3p7.vision.vision_fwd_patch_repl_os_flat6 import (
-                Step3p7VisionPatchReplOSFlat6 as TowerSingle,
-                Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
-                vTp as _patch_vtp,
-            )
-        elif _patch_tower == "patchmdec":
-            # GEMM-M-decoupling draft: the four FixPipe GEMMs
-            # raise M 48->128 (MQ_G=128), elementwise + attention stay MQ=48.
-            # The tower's baked RoPE/GEMM stride is vTp=1408, so the driver
-            # must pad cos/sin to it.
-            patch_vb = 6
-            from models.step3p7.vision.vision_fwd_patch_repl_os_flat6_mdec_draft import (
                 Step3p7VisionPatchReplOSFlat6 as TowerSingle,
                 Step3p7VisionPatchReplOSFlat6Chunked as TowerChunked,
                 vTp as _patch_vtp,
@@ -1052,60 +963,11 @@ def main():
         print(f"[l3repl] patch program: {'chunked x%d' % args.chunk if use_chunked else 'single-dispatch'}"
               f" (attention: {_patch_tower}, VB={patch_vb})")
     else:
-        if args.tower == "osfa":
-            from models.step3p7.vision.vision_fwd_repl_os_fa_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-            )
-        elif args.tower == "osfaslot":
-            # Ring-depth probe: osfa V1 form with the vfa mixed
-            # kernel's auto cube<->vec pipe deepened slot_num 4 -> 8
-            # (GM ring depth; the reference flash_attention_cv_split.py
-            # GM-staged-slot insight).
-            from models.step3p7.vision.vision_fwd_repl_os_fa_slot_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-            )
-        elif args.tower == "osfixpipe":
-            from models.step3p7.vision.vision_fwd_repl_os_fixpipe_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-            )
-        elif args.tower == "osmlpf1":
-            from models.step3p7.vision.vision_fwd_repl_os_mlpf1_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-            )
-        elif args.tower == "osn256":
-            from models.step3p7.vision.vision_fwd_repl_os_n256_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-            )
-        elif args.tower == "osmdec":
-            # GEMM-M-decoupling draft: GEMM M-tiles env-driven
-            # (PYPTO_QTM_G/PYPTO_QTM1_G, default 128 -> vTp=2816). The tower's
-            # baked RoPE stride is vTp, so the driver must pad cos/sin to it.
-            from models.step3p7.vision.vision_fwd_repl_os_mdec_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-                vTp as _os_vtp,
-            )
-        elif args.tower == "qkpv":
-            # Fused qk_pv attention draft: v2o+v2f replaced by
-            # vfa (fused QK+softmax+PV, KT=128 co-resident, M=48) + vfm
-            # (pure-VEC online merge), rebased on the M-decoupling production
-            # (QTM_G=128, vTp=2816). Golden compare = the same gates as os.
-            from models.step3p7.vision.vision_fwd_repl_os_qkpv_draft import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-                vTp as _os_vtp,
-            )
-        else:
-            from models.step3p7.vision.vision_fwd_repl_os import (
-                Step3p7VisionReplOS as TowerSingle,
-                Step3p7VisionReplOSChunked as TowerChunked,
-                vTp as _os_vtp,
-            )
+        from models.step3p7.vision.vision_fwd_repl_os import (
+            Step3p7VisionReplOS as TowerSingle,
+            Step3p7VisionReplOSChunked as TowerChunked,
+            vTp as _os_vtp,
+        )
         _pfx = ""
         use_chunked = args.chunk > 0 and layer is None and num_layers is None
         TowerProg = TowerChunked if use_chunked else TowerSingle

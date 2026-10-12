@@ -37,7 +37,6 @@ from .vision_full_fwd import (
     Step3p7Vision, V_GRID_DS1_PAD, PE_K_PAD, PE_ROWS_PAD,
     PatchEmbedProg, LnPreProg, Ds1Prog, Ds2Prog, ProjProg,
 )
-from .vision_fwd_patch import Step3p7VisionPatch
 
 
 def _specs_for(name):
@@ -144,23 +143,7 @@ def main() -> int:
             print(f"[vision_full] {name}: FAIL {exc}", flush=True)
             ok = False
 
-    # Patch-path tower (Phase 1a step 1: vT=1296, no B axis yet — structurally
-    # the global tower specialized to the 36x36 grid). Validates the patch
-    # specialization codegens before the B-axis retrofit. Reuses the SAME
-    # dist_cfg (8 cards). See vision_fwd_patch.py docstring.
-    patch_name = getattr(Step3p7VisionPatch, "name", None) or type(Step3p7VisionPatch).__name__
-    print(f"[vision_full] compiling patch tower {patch_name} tp={TP_WORLD_SIZE}", flush=True)
-    try:
-        compiled = ir.compile(
-            Step3p7VisionPatch, platform=args.platform,
-            distributed_config=dist_cfg, skip_ptoas=False,
-        )
-        print(f"[vision_full] patch tower: OK output_dir={compiled.output_dir}", flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[vision_full] patch tower: FAIL {exc}", flush=True)
-        ok = False
-
-    print(f"[vision_full] {'OK' if ok else 'FAIL'} (5 @pl.jit + 5 @pl.program + tower + patch tower)", flush=True)
+    print(f"[vision_full] {'OK' if ok else 'FAIL'} (5 @pl.jit + 5 @pl.program + tower)", flush=True)
     return 0 if ok else 1
 
 

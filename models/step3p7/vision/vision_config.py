@@ -77,9 +77,10 @@ V_TOKENS_FINAL_PAD = ((V_TOKENS_FINAL + 15) // 16) * 16   # 176
 # dumps whatever ImagePatcher produced, the drivers read n_crops from the
 # dump's B dim, and the kernels take capacity VB + runtime `active` scalar
 # (see V_PATCH_BATCH below). The patch path is ~63% of vision compute.
-# pypto implements it separately (vision_fwd_patch.py) with a real B axis so
-# all crops of one image run in one launch (the global tower is
-# single-sequence, no B axis).
+# pypto implements it separately (the patch REPL towers,
+# vision_fwd_patch_repl_os_flat6.py / _flat.py) with a real B axis so all
+# crops of one image run in one launch (the global tower is single-sequence,
+# no B axis).
 V_IMAGE_PATCH = 504                      # patch crop side (px)
 V_GRID_PATCH = V_IMAGE_PATCH // V_PATCH  # 36  -> 36*36 = 1296 patches/crop
 V_TOKENS_PATCH = V_GRID_PATCH * V_GRID_PATCH   # 1296
