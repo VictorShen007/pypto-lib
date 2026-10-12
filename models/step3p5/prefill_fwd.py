@@ -292,6 +292,30 @@ assert PREFILL_T % BATCH == 0, (
     f"PREFILL_T={PREFILL_T} must be a multiple of BATCH={BATCH} so the "
     "inlined prefill-T MoE adapter can chunk into whole decode-T tiles"
 )
+# P2 (perf): shared-expert TP-AR grouping (team-debug/008_perf_stage1
+# p2_proposal.md, blue-approved 2026-10-10). PREFILL_AR_GROUP merges the
+# per-tile [BATCH, HIDDEN] moe_tp_all_reduce barriers (22 per layer) into
+# SH_GROUP_COUNT grouped barriers and bursts the reduce-phase remote_loads
+# by the group factor (AR_GROUP x larger tiles, /AR_GROUP the count).
+# 0 (default) or 1 reproduces the unmerged path exactly: every derived
+# shape below evaluates to the historical values, and the paired loop body
+# sits behind a constant-folded ``if`` (the AST parser walks both arms —
+# the dead arm must stay parseable, see moe_tp_all_reduce_group — but
+# Simplify prunes it before codegen). 2 is the blue-approved paired v1 (UB
+# budget: [32,512] fp32 acc = 64 KB of the 184 KB Vec buffer; G=4's
+# 128 KB acc is excluded). Gate: PYPTO_PREFILL_AR_GROUP.
+PREFILL_AR_GROUP = int(_os.environ.get("PYPTO_PREFILL_AR_GROUP", "0"))
+assert PREFILL_AR_GROUP in (0, 1, 2), (
+    f"PREFILL_AR_GROUP={PREFILL_AR_GROUP} unsupported (v1 ships 0|1|2)"
+)
+# 0 = off: fold to the historical G=1 shapes (22 // 0 would fault).
+_ar_group = PREFILL_AR_GROUP or 1
+assert PREFILL_TILE_COUNT % _ar_group == 0, (
+    f"PREFILL_TILE_COUNT={PREFILL_TILE_COUNT} must be a multiple of "
+    f"PREFILL_AR_GROUP={PREFILL_AR_GROUP} for the paired MoE AR path"
+)
+SH_GROUP_COUNT = PREFILL_TILE_COUNT // _ar_group
+SH_TMP_ROWS = BATCH * _ar_group
 assert (
     (BATCH * TOPK) % PREFILL_A2A_ROWS == 0 and 0 < PREFILL_A2A_ROWS <= 32
 ), (
@@ -999,6 +1023,109 @@ def _build_prefill_fwd_program(
                     pl.cast(acc, target_type=pl.BF16, mode="rint"), [0, k0], local,
                 )
             return local
+
+        # ── Grouped shared-expert TP all-reduce (P2 paired path,
+        # p2_proposal.md §3.2). Both tiles' partials are staged into
+        # consecutive segments of tmp_window, ONE notify/wait round
+        # covers the pair (signal_window is a per-GROUP slot — each slot
+        # is used exactly once, preserving the R3 plan-a non-consuming-
+        # signal anti-race rule), and the reduce bursts the remote_loads
+        # to [2 * BATCH, ar_chunk] (half the count at twice the size).
+        # Bit-identical to the unmerged moe_tp_all_reduce above: each
+        # row still accumulates own -> peers ascending in FP32 with a
+        # single BF16 rint at the end — merging only changes the load
+        # batch size, never the per-row summation order. The reduced
+        # pair is stored DIRECTLY to sh_y0/sh_y1 via register-tile
+        # slicing (pl.slice precedent: _serialize_after_shared) and
+        # NEVER stored back into tmp_window: notify/wait is control-
+        # plane only (no data barrier inside the reduce loop), so a
+        # store-back would let a slower peer's remote_load of the same
+        # chunk read an already-reduced value (double-counting its own
+        # staged contribution, rank-divergent). tmp_window stays
+        # write-once per barrier round (stage only), matching the
+        # unmerged path's invariant.
+        # ALWAYS DEFINED (not gated on PREFILL_AR_GROUP): the AST parser
+        # walks BOTH arms of every ``if`` at parse time (the constant
+        # condition is folded later by Simplify), so the G=1 build still
+        # type-checks this body even though the G=1 call sites are dead.
+        # tmp_window is therefore DECLARED as the G=2 burst layout
+        # [2*BATCH, HIDDEN] — the static extent proof validates loads
+        # against the declared type, and rows [BATCH, 2*BATCH) are only
+        # out of bounds for the G=1 [BATCH, HIDDEN] window this function
+        # is never called with.
+        @pl.function(type=pl.FunctionType.InCore)
+        def moe_tp_all_reduce_group(
+            self,
+            sh_y0: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            sh_y1: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            tmp_window: pld.DistributedTensor[
+                [2 * BATCH, HIDDEN], pl.BF16
+            ],
+            signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        ]:
+            group_size = tp_size
+            ar_chunk = HIDDEN // 8
+            # Stage both partials into consecutive window segments
+            # (segment 0 = rows [0, BATCH), segment 1 = rows
+            # [BATCH, 2*BATCH) — the unmerged path reuses ONE [BATCH,
+            # HIDDEN] window per tile; here the pair coexists so the
+            # reduce can burst across both segments).
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage0 = pl.load(sh_y0, [0, k0], [BATCH, ar_chunk])
+                pl.store(stage0, [0, k0], tmp_window)
+                stage1 = pl.load(sh_y1, [0, k0], [BATCH, ar_chunk])
+                pl.store(stage1, [BATCH, k0], tmp_window)
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            # Burst reduce: one [2 * BATCH, ar_chunk] remote_load per
+            # peer per chunk (the unmerged path issues AR_GROUP [BATCH,
+            # ar_chunk] loads here). Row order inside the FP32
+            # accumulator is unchanged, so each BATCH-row half sums
+            # exactly like the unmerged reduce. Shapes are pinned to
+            # 2 * BATCH — the DECLARED window layout — rather than
+            # SH_TMP_ROWS: this body is type-checked even in the G=1
+            # build (it is always defined), where SH_TMP_ROWS == BATCH
+            # would make the second-half slice statically out of
+            # bounds; G=2 is unaffected (SH_TMP_ROWS == 2 * BATCH).
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own = pl.load(tmp_window, [0, k0], [2 * BATCH, ar_chunk])
+                acc = pl.cast(own, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[2 * BATCH, ar_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+                red = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                # pl.slice requires compile-time-constant shape/offset
+                # elements — module-level names fold (SCALE_W_PAD
+                # precedent in _serialize_after_shared), the local
+                # ``ar_chunk`` does not, hence the inline ``HIDDEN // 8``.
+                pl.store(
+                    pl.slice(red, [BATCH, HIDDEN // 8], [0, 0]),
+                    [0, k0], sh_y0,
+                )
+                pl.store(
+                    pl.slice(red, [BATCH, HIDDEN // 8], [BATCH, 0]),
+                    [0, k0], sh_y1,
+                )
+            return sh_y0, sh_y1
 
         # SERIALIZE shared tp_all_reduce -> routed dispatch (break overlap
         # deadlock): declares sh_y as an input so the orchestration forces the
@@ -1980,10 +2107,10 @@ def _build_prefill_fwd_program(
                 [tp_size, 1], pl.INT32
             ],
             sh_tmp_window: pld.DistributedTensor[
-                [BATCH, HIDDEN], pl.BF16
+                [SH_TMP_ROWS, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
-                [PREFILL_TILE_COUNT * tp_size, 1], pl.INT32
+                [SH_GROUP_COUNT * tp_size, 1], pl.INT32
             ],
             pub_counts: pld.DistributedTensor[
                 [PREFILL_TILE_COUNT * N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
@@ -2260,263 +2387,669 @@ def _build_prefill_fwd_program(
             moe_out = pl.create_tensor(
                 [PREFILL_T, HIDDEN], dtype=pl.BF16,
             )
-            for tile_idx in pl.range(PREFILL_TILE_COUNT):
-                t_lo = tile_idx * BATCH
-                tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                tile_post_norm = pl.create_tensor(
-                    [BATCH, HIDDEN], dtype=pl.BF16,
-                )
-                tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-                tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-                tile_x_scale = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_in",
-                ):
-                    tile_resid = pl.assemble(
-                        tile_resid,
-                        pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+            if PREFILL_AR_GROUP == 2:
+                # P2 paired path (PREFILL_AR_GROUP == 2,
+                # p2_proposal.md §3.2): two tiles share ONE
+                # barrier-style shared-expert TP-AR and a
+                # burst reduce. Layout X: each tile's
+                # serialize/.../combine tail runs after the
+                # grouped AR, trading the c(2i)<->s(2i+1)
+                # overlap for a halved barrier count
+                # (pre-registered trade, §4/§6). The
+                # unmerged loop in the else branch is
+                # verbatim modulo indentation (review with
+                # `git diff -w`). DIAG dump blocks omitted;
+                # see the unmerged loop for them.
+                for pair_idx in pl.range(SH_GROUP_COUNT):
+                    tile_idx0 = pair_idx * 2
+                    tile_idx1 = tile_idx0 + 1
+                    # -- Tile A prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo0 = tile_idx0 * BATCH
+                    tile_resid0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm0 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
                     )
-                    tile_post_norm = pl.assemble(
-                        tile_post_norm,
-                        pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    tile_inv_rms0 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i80 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
                     )
-                    tile_inv_rms = pl.assemble(
-                        tile_inv_rms,
-                        pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
-                        [0, 0],
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2a",
+                    ):
+                        tile_resid0 = pl.assemble(
+                            tile_resid0,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm0 = pl.assemble(
+                            tile_post_norm0,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms0 = pl.assemble(
+                            tile_inv_rms0,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i80 = pl.assemble(
+                            tile_x_i80,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale0 = pl.assemble(
+                            tile_x_scale0,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo0, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
                     )
-                    tile_x_i8 = pl.assemble(
-                        tile_x_i8,
-                        pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
                     )
-                    tile_x_scale = pl.assemble(
-                        tile_x_scale,
-                        pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = self.gate_step(
+                        tile_resid0, post_rms_weight, norm_layer_idx, tile_inv_rms0,
+                        gate_w, router_bias,
+                        expert_indices0, expert_weights0,
                     )
 
-                # 1) Gate (local, replicated).
-                expert_indices = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.INT32,
-                )
-                expert_weights = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.FP32,
-                )
-                expert_weights = self.gate_step(
-                    tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
-                    gate_w, router_bias,
-                    expert_indices, expert_weights,
-                )
+                    sh_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y0 = self.expert_shared_step(
+                        tile_post_norm0, w_gate_s, w_up_s, w_down_s, sh_y0,
+                    )
+                    # -- Tile B prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo1 = tile_idx1 * BATCH
+                    tile_resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm1 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms1 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i81 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2b",
+                    ):
+                        tile_resid1 = pl.assemble(
+                            tile_resid1,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm1 = pl.assemble(
+                            tile_post_norm1,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms1 = pl.assemble(
+                            tile_inv_rms1,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i81 = pl.assemble(
+                            tile_x_i81,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale1 = pl.assemble(
+                            tile_x_scale1,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo1, 0]),
+                            [0, 0],
+                        )
 
-                # DIAG: accumulate gate top-K into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
-                    # expert_indices_dump = pl.assemble(
-                        # expert_indices_dump,
-                        # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                    # expert_weights_dump = pl.assemble(
-                        # expert_weights_dump,
-                        # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
-                sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                sh_y = self.expert_shared_step(
-                    tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-                )
-                self.moe_tp_all_reduce(
-                    sh_y, sh_tmp_window,
-                    pl.slice(
-                        sh_signal_window, [tp_size, 1],
-                        [tile_idx * tp_size, 0],
-                    ),
-                    my_rank,
-                )
+                    # 1) Gate (local, replicated).
+                    expert_indices1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights1 = self.gate_step(
+                        tile_resid1, post_rms_weight, norm_layer_idx, tile_inv_rms1,
+                        gate_w, router_bias,
+                        expert_indices1, expert_weights1,
+                    )
 
-                # DIAG (bisect shared): TP-reduced shared-expert output.
-                # DIAG: accumulate TP-reduced shared-expert output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
-                    # for kb1 in pl.range(HIDDEN // K_CHUNK):
-                        # k01 = kb1 * K_CHUNK
-                        # sh_y_dump = pl.assemble(
-                            # sh_y_dump,
-                            # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
-                            # [t_lo, k01],
+                    sh_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y1 = self.expert_shared_step(
+                        tile_post_norm1, w_gate_s, w_up_s, w_down_s, sh_y1,
+                    )
+                    # 3) Grouped shared-expert TP-AR (P2): one
+                    # barrier round + burst reduce for BOTH
+                    # tiles (each row's FP32 summation order is
+                    # unchanged — moe_tp_all_reduce_group).
+                    sh_y0, sh_y1 = self.moe_tp_all_reduce_group(
+                        sh_y0, sh_y1, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [pair_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+                    # -- Tile A tail: serialize -> dispatch ->
+                    # routed -> combine -> assemble. ─────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale0 (see _serialize_after_shared).
+                    tile_x_scale_ser0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale0 = self._serialize_after_shared(
+                        tile_x_scale0, sh_y0, tile_x_scale_ser0,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile0 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx0 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile0 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile0 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile0 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile0 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile0 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx0 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile0 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx0 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale0 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile0, send_scale_buf_tile0,
+                        recv_x_tile0, recv_scale_tile0,
+                    )
+                    (
+                        local_routed_x0,
+                        local_routed_x_scale0,
+                        local_expert_offset0,
+                        local_expert_count0,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i80, tile_x_scale0, expert_indices0,
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        send_buf_tile0, send_scale_buf_tile0,
+                        pub_counts_tile0,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        recv_x_tile0, recv_scale_tile0,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y0 = self.expert_routed_step(
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y0,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y0 add).
+                    tile_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig0 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig0 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    tile_y0 = self.moe_combine_step(
+                        local_routed_y0,
+                        expert_indices0, expert_weights0, sh_y0,
+                        tile_y0,
+                        pub_counts_tile0, src_route_table_tile0,
+                        route_pub_tile_sig0,
+                        routed_y_buf_tile0,
+                        combine_done_tile_sig0,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2a",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y0, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo0, 0],
+                        )
+
+                    # -- Tile B tail (same sequence). ────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale1 (see _serialize_after_shared).
+                    tile_x_scale_ser1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale1 = self._serialize_after_shared(
+                        tile_x_scale1, sh_y1, tile_x_scale_ser1,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile1 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx1 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile1 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile1 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile1 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile1 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile1 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx1 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile1 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx1 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale1 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile1, send_scale_buf_tile1,
+                        recv_x_tile1, recv_scale_tile1,
+                    )
+                    (
+                        local_routed_x1,
+                        local_routed_x_scale1,
+                        local_expert_offset1,
+                        local_expert_count1,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i81, tile_x_scale1, expert_indices1,
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        send_buf_tile1, send_scale_buf_tile1,
+                        pub_counts_tile1,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        recv_x_tile1, recv_scale_tile1,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y1 = self.expert_routed_step(
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y1,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y1 add).
+                    tile_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig1 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig1 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    tile_y1 = self.moe_combine_step(
+                        local_routed_y1,
+                        expert_indices1, expert_weights1, sh_y1,
+                        tile_y1,
+                        pub_counts_tile1, src_route_table_tile1,
+                        route_pub_tile_sig1,
+                        routed_y_buf_tile1,
+                        combine_done_tile_sig1,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2b",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y1, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo1, 0],
+                        )
+
+            else:
+                for tile_idx in pl.range(PREFILL_TILE_COUNT):
+                    t_lo = tile_idx * BATCH
+                    tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in",
+                    ):
+                        tile_resid = pl.assemble(
+                            tile_resid,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm = pl.assemble(
+                            tile_post_norm,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms = pl.assemble(
+                            tile_inv_rms,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i8 = pl.assemble(
+                            tile_x_i8,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale = pl.assemble(
+                            tile_x_scale,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights = self.gate_step(
+                        tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
+                        gate_w, router_bias,
+                        expert_indices, expert_weights,
+                    )
+
+                    # DIAG: accumulate gate top-K into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
+                        # expert_indices_dump = pl.assemble(
+                            # expert_indices_dump,
+                            # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # Serialize shared TP -> routed dispatch so dispatch reads the
-                # completed tile_x_scale (see _serialize_after_shared).
-                tile_x_scale_ser = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                tile_x_scale = self._serialize_after_shared(
-                    tile_x_scale, sh_y, tile_x_scale_ser,
-                )
-                # NaN DIAG: producer send-side dequant scale (pre-dispatch).
-
-                # Per-tile data-window views (Orchestration scope): the 5 EP
-                # data windows are shared across the 8-tile unroll, so slice a
-                # fresh per-tile view to stop tile i+1's zero/push from racing
-                # tile i's gather (same per-tile scheme as the signal windows).
-                pub_counts_tile = pl.slice(
-                    pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
-                    [tile_idx * N_RANKS * N_RANKS, 0],
-                )
-                send_buf_tile = pl.slice(
-                    send_buf, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                send_scale_buf_tile = pl.slice(
-                    send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 1): packed send-side scale window.
-                recv_x_tile = pl.slice(
-                    recv_x, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                recv_scale_tile = pl.slice(
-                    recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
-                src_route_table_tile = pl.slice(
-                    src_route_table,
-                    [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
-                    [tile_idx * N_RANKS, 0, 0],
-                )
-                routed_y_buf_tile = pl.slice(
-                    routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
-                    [tile_idx * N_ROUTES_PER_RANK, 0],
-                )
-
-                # 3) Dispatch (EP all-to-all).
-                local_routed_x = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
-                )
-                local_routed_x_scale = pl.create_tensor(
-                    [1, LOCAL_RECV_MAX], dtype=pl.FP32,
-                )
-                local_expert_offset = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                local_expert_count = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                self.zero_dispatch_buffers_step(
-                    send_buf_tile, send_scale_buf_tile,
-                    recv_x_tile, recv_scale_tile,
-                )
-                (
-                    local_routed_x,
-                    local_routed_x_scale,
-                    local_expert_offset,
-                    local_expert_count,
-                ) = self.moe_dispatch_step(
-                    tile_x_i8, tile_x_scale, expert_indices,
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    send_buf_tile, send_scale_buf_tile,
-                    pub_counts_tile,
-                    pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    recv_x_tile, recv_scale_tile,
-                    pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    my_rank,
-                )
-                # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
-                # DIAG: accumulate per-token dequant scale into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
-                    # local_routed_x_scale_dump = pl.assemble(
-                        # local_routed_x_scale_dump,
-                        # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
-                        # [0, tile_idx * N_ROUTES_PER_RANK],
-                    # )
-                # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
-                # DIAG: accumulate reordered routed input into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
-                    # for kb_x in pl.range(HIDDEN // K_CHUNK):
-                        # kx0 = kb_x * K_CHUNK
-                        # local_routed_x_dump = pl.assemble(
-                            # local_routed_x_dump,
-                            # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                        # expert_weights_dump = pl.assemble(
+                            # expert_weights_dump,
+                            # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # 4) Routed experts (local 36).
-                local_routed_y = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
-                )
-                local_routed_y = self.expert_routed_step(
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    w_gate_r, w_gate_r_scale,
-                    w_up_r, w_up_r_scale,
-                    w_down_r, w_down_r_scale,
-                    local_routed_y,
-                )
-
-                # DIAG (bisect routed): per-local-expert output pre-combine.
-                # DIAG: accumulate routed expert output into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
-                    # for kb_y in pl.range(HIDDEN // K_CHUNK):
-                        # ky0 = kb_y * K_CHUNK
-                        # local_routed_y_dump = pl.assemble(
-                            # local_routed_y_dump,
-                            # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, ky0],
-                        # )
-
-                # 5) Combine (EP a2a back + weighted gather + sh_y add).
-                tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                # Bind per-tile signal slices to named DistributedTensor views
-                # at Orchestration scope before the Inline combine step inlines
-                # them: an inline pl.slice(...) arg would splice into the
-                # route_pub barrier's CORE_GROUP scope, where
-                # ConvertTensorToTileOps demotes it to a TileType and
-                # pld.system.notify rejects it (must stay window-bound).
-                route_pub_tile_sig = pl.slice(
-                    route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                combine_done_tile_sig = pl.slice(
-                    combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                tile_y = self.moe_combine_step(
-                    local_routed_y,
-                    expert_indices, expert_weights, sh_y,
-                    tile_y,
-                    pub_counts_tile, src_route_table_tile,
-                    route_pub_tile_sig,
-                    routed_y_buf_tile,
-                    combine_done_tile_sig,
-                    my_rank,
-                )
-                # NaN DIAG: combined MoE output — should be TP-replicated.
-                # DIAG: accumulate combined MoE output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
-                    # for kb2 in pl.range(HIDDEN // K_CHUNK):
-                        # k02 = kb2 * K_CHUNK
-                        # tile_y_dump = pl.assemble(
-                            # tile_y_dump,
-                            # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
-                            # [t_lo, k02],
-                        # )
-
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_out",
-                ):
-                    moe_out = pl.assemble(
-                        moe_out,
-                        pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
-                        [t_lo, 0],
+                    # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+                    sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y = self.expert_shared_step(
+                        tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
                     )
+                    self.moe_tp_all_reduce(
+                        sh_y, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [tile_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+
+                    # DIAG (bisect shared): TP-reduced shared-expert output.
+                    # DIAG: accumulate TP-reduced shared-expert output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
+                        # for kb1 in pl.range(HIDDEN // K_CHUNK):
+                            # k01 = kb1 * K_CHUNK
+                            # sh_y_dump = pl.assemble(
+                                # sh_y_dump,
+                                # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
+                                # [t_lo, k01],
+                            # )
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale (see _serialize_after_shared).
+                    tile_x_scale_ser = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale = self._serialize_after_shared(
+                        tile_x_scale, sh_y, tile_x_scale_ser,
+                    )
+                    # NaN DIAG: producer send-side dequant scale (pre-dispatch).
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 1): packed send-side scale window.
+                    recv_x_tile = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
+                    src_route_table_tile = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile, send_scale_buf_tile,
+                        recv_x_tile, recv_scale_tile,
+                    )
+                    (
+                        local_routed_x,
+                        local_routed_x_scale,
+                        local_expert_offset,
+                        local_expert_count,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i8, tile_x_scale, expert_indices,
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        send_buf_tile, send_scale_buf_tile,
+                        pub_counts_tile,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        recv_x_tile, recv_scale_tile,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        my_rank,
+                    )
+                    # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
+                    # DIAG: accumulate per-token dequant scale into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
+                        # local_routed_x_scale_dump = pl.assemble(
+                            # local_routed_x_scale_dump,
+                            # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
+                            # [0, tile_idx * N_ROUTES_PER_RANK],
+                        # )
+                    # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
+                    # DIAG: accumulate reordered routed input into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
+                        # for kb_x in pl.range(HIDDEN // K_CHUNK):
+                            # kx0 = kb_x * K_CHUNK
+                            # local_routed_x_dump = pl.assemble(
+                                # local_routed_x_dump,
+                                # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                            # )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y = self.expert_routed_step(
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y,
+                    )
+
+                    # DIAG (bisect routed): per-local-expert output pre-combine.
+                    # DIAG: accumulate routed expert output into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
+                        # for kb_y in pl.range(HIDDEN // K_CHUNK):
+                            # ky0 = kb_y * K_CHUNK
+                            # local_routed_y_dump = pl.assemble(
+                                # local_routed_y_dump,
+                                # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, ky0],
+                            # )
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y add).
+                    tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    tile_y = self.moe_combine_step(
+                        local_routed_y,
+                        expert_indices, expert_weights, sh_y,
+                        tile_y,
+                        pub_counts_tile, src_route_table_tile,
+                        route_pub_tile_sig,
+                        routed_y_buf_tile,
+                        combine_done_tile_sig,
+                        my_rank,
+                    )
+                    # NaN DIAG: combined MoE output — should be TP-replicated.
+                    # DIAG: accumulate combined MoE output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
+                        # for kb2 in pl.range(HIDDEN // K_CHUNK):
+                            # k02 = kb2 * K_CHUNK
+                            # tile_y_dump = pl.assemble(
+                                # tile_y_dump,
+                                # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
+                                # [t_lo, k02],
+                            # )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo, 0],
+                        )
 
             # Module dump 8: ffn_output (combined shared+routed MoE output,
             # pre-residual-add, TP-replicated).
@@ -2620,10 +3153,10 @@ def _build_prefill_fwd_program(
                 [tp_size, 1], pl.INT32
             ],
             sh_tmp_window: pld.DistributedTensor[
-                [BATCH, HIDDEN], pl.BF16
+                [SH_TMP_ROWS, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
-                [PREFILL_TILE_COUNT * tp_size, 1], pl.INT32
+                [SH_GROUP_COUNT * tp_size, 1], pl.INT32
             ],
             pub_counts: pld.DistributedTensor[
                 [PREFILL_TILE_COUNT * N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
@@ -2906,263 +3439,671 @@ def _build_prefill_fwd_program(
             moe_out = pl.create_tensor(
                 [PREFILL_T, HIDDEN], dtype=pl.BF16,
             )
-            for tile_idx in pl.range(PREFILL_TILE_COUNT):
-                t_lo = tile_idx * BATCH
-                tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                tile_post_norm = pl.create_tensor(
-                    [BATCH, HIDDEN], dtype=pl.BF16,
-                )
-                tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-                tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-                tile_x_scale = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_in",
-                ):
-                    tile_resid = pl.assemble(
-                        tile_resid,
-                        pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+            if PREFILL_AR_GROUP == 2:
+                # P2 paired path (PREFILL_AR_GROUP == 2,
+                # p2_proposal.md §3.2): two tiles share ONE
+                # barrier-style shared-expert TP-AR and a
+                # burst reduce. Layout X: each tile's
+                # serialize/.../combine tail runs after the
+                # grouped AR, trading the c(2i)<->s(2i+1)
+                # overlap for a halved barrier count
+                # (pre-registered trade, §4/§6). The
+                # unmerged loop in the else branch is
+                # verbatim modulo indentation (review with
+                # `git diff -w`). DIAG dump blocks omitted;
+                # see the unmerged loop for them.
+                for pair_idx in pl.range(SH_GROUP_COUNT):
+                    tile_idx0 = pair_idx * 2
+                    tile_idx1 = tile_idx0 + 1
+                    # -- Tile A prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo0 = tile_idx0 * BATCH
+                    tile_resid0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm0 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
                     )
-                    tile_post_norm = pl.assemble(
-                        tile_post_norm,
-                        pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    tile_inv_rms0 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i80 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
                     )
-                    tile_inv_rms = pl.assemble(
-                        tile_inv_rms,
-                        pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
-                        [0, 0],
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2a",
+                    ):
+                        tile_resid0 = pl.assemble(
+                            tile_resid0,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm0 = pl.assemble(
+                            tile_post_norm0,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms0 = pl.assemble(
+                            tile_inv_rms0,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i80 = pl.assemble(
+                            tile_x_i80,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale0 = pl.assemble(
+                            tile_x_scale0,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo0, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
                     )
-                    tile_x_i8 = pl.assemble(
-                        tile_x_i8,
-                        pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
                     )
-                    tile_x_scale = pl.assemble(
-                        tile_x_scale,
-                        pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = self.gate_step(
+                        tile_resid0, post_rms_weight, norm_layer_idx, tile_inv_rms0,
+                        gate_w, router_bias,
+                        expert_indices0, expert_weights0,
                     )
 
-                # 1) Gate (local, replicated).
-                expert_indices = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.INT32,
-                )
-                expert_weights = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.FP32,
-                )
-                expert_weights = self.gate_step(
-                    tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
-                    gate_w, router_bias,
-                    expert_indices, expert_weights,
-                )
+                    sh_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y0 = self.expert_shared_step(
+                        tile_post_norm0, w_gate_s, w_up_s, w_down_s, sh_y0,
+                    )
+                    # -- Tile B prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo1 = tile_idx1 * BATCH
+                    tile_resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm1 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms1 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i81 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2b",
+                    ):
+                        tile_resid1 = pl.assemble(
+                            tile_resid1,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm1 = pl.assemble(
+                            tile_post_norm1,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms1 = pl.assemble(
+                            tile_inv_rms1,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i81 = pl.assemble(
+                            tile_x_i81,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale1 = pl.assemble(
+                            tile_x_scale1,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo1, 0]),
+                            [0, 0],
+                        )
 
-                # DIAG: accumulate gate top-K into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
-                    # expert_indices_dump = pl.assemble(
-                        # expert_indices_dump,
-                        # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                    # expert_weights_dump = pl.assemble(
-                        # expert_weights_dump,
-                        # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
-                sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                sh_y = self.expert_shared_step(
-                    tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-                )
-                self.moe_tp_all_reduce(
-                    sh_y, sh_tmp_window,
-                    pl.slice(
-                        sh_signal_window, [tp_size, 1],
-                        [tile_idx * tp_size, 0],
-                    ),
-                    my_rank,
-                )
+                    # 1) Gate (local, replicated).
+                    expert_indices1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights1 = self.gate_step(
+                        tile_resid1, post_rms_weight, norm_layer_idx, tile_inv_rms1,
+                        gate_w, router_bias,
+                        expert_indices1, expert_weights1,
+                    )
 
-                # DIAG (bisect shared): TP-reduced shared-expert output.
-                # DIAG: accumulate TP-reduced shared-expert output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
-                    # for kb1 in pl.range(HIDDEN // K_CHUNK):
-                        # k01 = kb1 * K_CHUNK
-                        # sh_y_dump = pl.assemble(
-                            # sh_y_dump,
-                            # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
-                            # [t_lo, k01],
+                    sh_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y1 = self.expert_shared_step(
+                        tile_post_norm1, w_gate_s, w_up_s, w_down_s, sh_y1,
+                    )
+                    # 3) Grouped shared-expert TP-AR (P2): one
+                    # barrier round + burst reduce for BOTH
+                    # tiles (each row's FP32 summation order is
+                    # unchanged — moe_tp_all_reduce_group).
+                    sh_y0, sh_y1 = self.moe_tp_all_reduce_group(
+                        sh_y0, sh_y1, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [pair_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+                    # -- Tile A tail: serialize -> dispatch ->
+                    # routed -> combine -> assemble. ─────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale0 (see _serialize_after_shared).
+                    tile_x_scale_ser0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale0 = self._serialize_after_shared(
+                        tile_x_scale0, sh_y0, tile_x_scale_ser0,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile0 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx0 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile0 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile0 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile0 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile0 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile0 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx0 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile0 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx0 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale0 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile0, send_scale_buf_tile0,
+                        recv_x_tile0, recv_scale_tile0,
+                    )
+                    (
+                        local_routed_x0,
+                        local_routed_x_scale0,
+                        local_expert_offset0,
+                        local_expert_count0,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i80, tile_x_scale0, expert_indices0,
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        send_buf_tile0, send_scale_buf_tile0,
+                        pub_counts_tile0,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        recv_x_tile0, recv_scale_tile0,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y0 = self.expert_routed_step(
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y0,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y0 add).
+                    tile_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig0 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig0 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    tile_y0 = self.moe_combine_step(
+                        local_routed_y0,
+                        expert_indices0, expert_weights0, sh_y0,
+                        tile_y0,
+                        pub_counts_tile0, src_route_table_tile0,
+                        route_pub_tile_sig0,
+                        routed_y_buf_tile0,
+                        combine_done_tile_sig0,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2a",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y0, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo0, 0],
+                        )
+
+
+                    # -- Tile B tail (same sequence). ────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale1 (see _serialize_after_shared).
+                    tile_x_scale_ser1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale1 = self._serialize_after_shared(
+                        tile_x_scale1, sh_y1, tile_x_scale_ser1,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile1 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx1 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile1 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile1 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile1 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile1 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile1 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx1 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile1 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx1 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale1 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile1, send_scale_buf_tile1,
+                        recv_x_tile1, recv_scale_tile1,
+                    )
+                    (
+                        local_routed_x1,
+                        local_routed_x_scale1,
+                        local_expert_offset1,
+                        local_expert_count1,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i81, tile_x_scale1, expert_indices1,
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        send_buf_tile1, send_scale_buf_tile1,
+                        pub_counts_tile1,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        recv_x_tile1, recv_scale_tile1,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y1 = self.expert_routed_step(
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y1,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y1 add).
+                    tile_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig1 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig1 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    tile_y1 = self.moe_combine_step(
+                        local_routed_y1,
+                        expert_indices1, expert_weights1, sh_y1,
+                        tile_y1,
+                        pub_counts_tile1, src_route_table_tile1,
+                        route_pub_tile_sig1,
+                        routed_y_buf_tile1,
+                        combine_done_tile_sig1,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2b",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y1, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo1, 0],
+                        )
+
+
+            else:
+                for tile_idx in pl.range(PREFILL_TILE_COUNT):
+                    t_lo = tile_idx * BATCH
+                    tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in",
+                    ):
+                        tile_resid = pl.assemble(
+                            tile_resid,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm = pl.assemble(
+                            tile_post_norm,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms = pl.assemble(
+                            tile_inv_rms,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i8 = pl.assemble(
+                            tile_x_i8,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale = pl.assemble(
+                            tile_x_scale,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights = self.gate_step(
+                        tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
+                        gate_w, router_bias,
+                        expert_indices, expert_weights,
+                    )
+
+                    # DIAG: accumulate gate top-K into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
+                        # expert_indices_dump = pl.assemble(
+                            # expert_indices_dump,
+                            # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # Serialize shared TP -> routed dispatch so dispatch reads the
-                # completed tile_x_scale (see _serialize_after_shared).
-                tile_x_scale_ser = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                tile_x_scale = self._serialize_after_shared(
-                    tile_x_scale, sh_y, tile_x_scale_ser,
-                )
-                # NaN DIAG: producer send-side dequant scale (pre-dispatch).
-
-                # Per-tile data-window views (Orchestration scope): the 5 EP
-                # data windows are shared across the 8-tile unroll, so slice a
-                # fresh per-tile view to stop tile i+1's zero/push from racing
-                # tile i's gather (same per-tile scheme as the signal windows).
-                pub_counts_tile = pl.slice(
-                    pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
-                    [tile_idx * N_RANKS * N_RANKS, 0],
-                )
-                send_buf_tile = pl.slice(
-                    send_buf, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                send_scale_buf_tile = pl.slice(
-                    send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 1): packed send-side scale window.
-                recv_x_tile = pl.slice(
-                    recv_x, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                recv_scale_tile = pl.slice(
-                    recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
-                src_route_table_tile = pl.slice(
-                    src_route_table,
-                    [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
-                    [tile_idx * N_RANKS, 0, 0],
-                )
-                routed_y_buf_tile = pl.slice(
-                    routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
-                    [tile_idx * N_ROUTES_PER_RANK, 0],
-                )
-
-                # 3) Dispatch (EP all-to-all).
-                local_routed_x = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
-                )
-                local_routed_x_scale = pl.create_tensor(
-                    [1, LOCAL_RECV_MAX], dtype=pl.FP32,
-                )
-                local_expert_offset = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                local_expert_count = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                self.zero_dispatch_buffers_step(
-                    send_buf_tile, send_scale_buf_tile,
-                    recv_x_tile, recv_scale_tile,
-                )
-                (
-                    local_routed_x,
-                    local_routed_x_scale,
-                    local_expert_offset,
-                    local_expert_count,
-                ) = self.moe_dispatch_step(
-                    tile_x_i8, tile_x_scale, expert_indices,
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    send_buf_tile, send_scale_buf_tile,
-                    pub_counts_tile,
-                    pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    recv_x_tile, recv_scale_tile,
-                    pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    my_rank,
-                )
-                # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
-                # DIAG: accumulate per-token dequant scale into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
-                    # local_routed_x_scale_dump = pl.assemble(
-                        # local_routed_x_scale_dump,
-                        # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
-                        # [0, tile_idx * N_ROUTES_PER_RANK],
-                    # )
-                # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
-                # DIAG: accumulate reordered routed input into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
-                    # for kb_x in pl.range(HIDDEN // K_CHUNK):
-                        # kx0 = kb_x * K_CHUNK
-                        # local_routed_x_dump = pl.assemble(
-                            # local_routed_x_dump,
-                            # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                        # expert_weights_dump = pl.assemble(
+                            # expert_weights_dump,
+                            # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # 4) Routed experts (local 36).
-                local_routed_y = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
-                )
-                local_routed_y = self.expert_routed_step(
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    w_gate_r, w_gate_r_scale,
-                    w_up_r, w_up_r_scale,
-                    w_down_r, w_down_r_scale,
-                    local_routed_y,
-                )
-
-                # DIAG (bisect routed): per-local-expert output pre-combine.
-                # DIAG: accumulate routed expert output into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
-                    # for kb_y in pl.range(HIDDEN // K_CHUNK):
-                        # ky0 = kb_y * K_CHUNK
-                        # local_routed_y_dump = pl.assemble(
-                            # local_routed_y_dump,
-                            # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, ky0],
-                        # )
-
-                # 5) Combine (EP a2a back + weighted gather + sh_y add).
-                tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                # Bind per-tile signal slices to named DistributedTensor views
-                # at Orchestration scope before the Inline combine step inlines
-                # them: an inline pl.slice(...) arg would splice into the
-                # route_pub barrier's CORE_GROUP scope, where
-                # ConvertTensorToTileOps demotes it to a TileType and
-                # pld.system.notify rejects it (must stay window-bound).
-                route_pub_tile_sig = pl.slice(
-                    route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                combine_done_tile_sig = pl.slice(
-                    combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                tile_y = self.moe_combine_step(
-                    local_routed_y,
-                    expert_indices, expert_weights, sh_y,
-                    tile_y,
-                    pub_counts_tile, src_route_table_tile,
-                    route_pub_tile_sig,
-                    routed_y_buf_tile,
-                    combine_done_tile_sig,
-                    my_rank,
-                )
-                # NaN DIAG: combined MoE output — should be TP-replicated.
-                # DIAG: accumulate combined MoE output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
-                    # for kb2 in pl.range(HIDDEN // K_CHUNK):
-                        # k02 = kb2 * K_CHUNK
-                        # tile_y_dump = pl.assemble(
-                            # tile_y_dump,
-                            # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
-                            # [t_lo, k02],
-                        # )
-
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_out",
-                ):
-                    moe_out = pl.assemble(
-                        moe_out,
-                        pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
-                        [t_lo, 0],
+                    # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+                    sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y = self.expert_shared_step(
+                        tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
                     )
+                    self.moe_tp_all_reduce(
+                        sh_y, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [tile_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+
+                    # DIAG (bisect shared): TP-reduced shared-expert output.
+                    # DIAG: accumulate TP-reduced shared-expert output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
+                        # for kb1 in pl.range(HIDDEN // K_CHUNK):
+                            # k01 = kb1 * K_CHUNK
+                            # sh_y_dump = pl.assemble(
+                                # sh_y_dump,
+                                # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
+                                # [t_lo, k01],
+                            # )
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale (see _serialize_after_shared).
+                    tile_x_scale_ser = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale = self._serialize_after_shared(
+                        tile_x_scale, sh_y, tile_x_scale_ser,
+                    )
+                    # NaN DIAG: producer send-side dequant scale (pre-dispatch).
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 1): packed send-side scale window.
+                    recv_x_tile = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
+                    src_route_table_tile = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile, send_scale_buf_tile,
+                        recv_x_tile, recv_scale_tile,
+                    )
+                    (
+                        local_routed_x,
+                        local_routed_x_scale,
+                        local_expert_offset,
+                        local_expert_count,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i8, tile_x_scale, expert_indices,
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        send_buf_tile, send_scale_buf_tile,
+                        pub_counts_tile,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        recv_x_tile, recv_scale_tile,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        my_rank,
+                    )
+                    # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
+                    # DIAG: accumulate per-token dequant scale into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
+                        # local_routed_x_scale_dump = pl.assemble(
+                            # local_routed_x_scale_dump,
+                            # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
+                            # [0, tile_idx * N_ROUTES_PER_RANK],
+                        # )
+                    # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
+                    # DIAG: accumulate reordered routed input into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
+                        # for kb_x in pl.range(HIDDEN // K_CHUNK):
+                            # kx0 = kb_x * K_CHUNK
+                            # local_routed_x_dump = pl.assemble(
+                                # local_routed_x_dump,
+                                # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                            # )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y = self.expert_routed_step(
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y,
+                    )
+
+                    # DIAG (bisect routed): per-local-expert output pre-combine.
+                    # DIAG: accumulate routed expert output into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
+                        # for kb_y in pl.range(HIDDEN // K_CHUNK):
+                            # ky0 = kb_y * K_CHUNK
+                            # local_routed_y_dump = pl.assemble(
+                                # local_routed_y_dump,
+                                # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, ky0],
+                            # )
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y add).
+                    tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    tile_y = self.moe_combine_step(
+                        local_routed_y,
+                        expert_indices, expert_weights, sh_y,
+                        tile_y,
+                        pub_counts_tile, src_route_table_tile,
+                        route_pub_tile_sig,
+                        routed_y_buf_tile,
+                        combine_done_tile_sig,
+                        my_rank,
+                    )
+                    # NaN DIAG: combined MoE output — should be TP-replicated.
+                    # DIAG: accumulate combined MoE output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
+                        # for kb2 in pl.range(HIDDEN // K_CHUNK):
+                            # k02 = kb2 * K_CHUNK
+                            # tile_y_dump = pl.assemble(
+                                # tile_y_dump,
+                                # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
+                                # [t_lo, k02],
+                            # )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo, 0],
+                        )
 
 
             # Module dump 8: ffn_output (combined shared+routed MoE output,
@@ -3267,10 +4208,10 @@ def _build_prefill_fwd_program(
                 [tp_size, 1], pl.INT32
             ],
             sh_tmp_window: pld.DistributedTensor[
-                [BATCH, HIDDEN], pl.BF16
+                [SH_TMP_ROWS, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
-                [PREFILL_TILE_COUNT * tp_size, 1], pl.INT32
+                [SH_GROUP_COUNT * tp_size, 1], pl.INT32
             ],
             pub_counts: pld.DistributedTensor[
                 [PREFILL_TILE_COUNT * N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
@@ -3526,264 +4467,670 @@ def _build_prefill_fwd_program(
             moe_out = pl.create_tensor(
                 [PREFILL_T, HIDDEN], dtype=pl.BF16,
             )
-            for tile_idx in pl.range(PREFILL_TILE_COUNT):
-                t_lo = tile_idx * BATCH
-                tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                tile_post_norm = pl.create_tensor(
-                    [BATCH, HIDDEN], dtype=pl.BF16,
-                )
-                tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-                tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-                tile_x_scale = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_in",
-                ):
-                    tile_resid = pl.assemble(
-                        tile_resid,
-                        pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+            if PREFILL_AR_GROUP == 2:
+                # P2 paired path (PREFILL_AR_GROUP == 2,
+                # p2_proposal.md §3.2): two tiles share ONE
+                # barrier-style shared-expert TP-AR and a
+                # burst reduce. Layout X: each tile's
+                # serialize/.../combine tail runs after the
+                # grouped AR, trading the c(2i)<->s(2i+1)
+                # overlap for a halved barrier count
+                # (pre-registered trade, §4/§6). The
+                # unmerged loop in the else branch is
+                # verbatim modulo indentation (review with
+                # `git diff -w`). DIAG dump blocks omitted;
+                # see the unmerged loop for them.
+                for pair_idx in pl.range(SH_GROUP_COUNT):
+                    tile_idx0 = pair_idx * 2
+                    tile_idx1 = tile_idx0 + 1
+                    # -- Tile A prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo0 = tile_idx0 * BATCH
+                    tile_resid0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm0 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
                     )
-                    tile_post_norm = pl.assemble(
-                        tile_post_norm,
-                        pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    tile_inv_rms0 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i80 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
                     )
-                    tile_inv_rms = pl.assemble(
-                        tile_inv_rms,
-                        pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
-                        [0, 0],
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2a",
+                    ):
+                        tile_resid0 = pl.assemble(
+                            tile_resid0,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm0 = pl.assemble(
+                            tile_post_norm0,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms0 = pl.assemble(
+                            tile_inv_rms0,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i80 = pl.assemble(
+                            tile_x_i80,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale0 = pl.assemble(
+                            tile_x_scale0,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo0, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
                     )
-                    tile_x_i8 = pl.assemble(
-                        tile_x_i8,
-                        pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
                     )
-                    tile_x_scale = pl.assemble(
-                        tile_x_scale,
-                        pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = self.gate_step(
+                        tile_resid0, post_rms_weight, norm_layer_idx, tile_inv_rms0,
+                        gate_w, router_bias,
+                        expert_indices0, expert_weights0,
                     )
 
-                # 1) Gate (local, replicated).
-                expert_indices = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.INT32,
-                )
-                expert_weights = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.FP32,
-                )
-                expert_weights = self.gate_step(
-                    tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
-                    gate_w, router_bias,
-                    expert_indices, expert_weights,
-                )
+                    sh_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y0 = self.expert_shared_step(
+                        tile_post_norm0, w_gate_s, w_up_s, w_down_s, sh_y0,
+                    )
+                    # -- Tile B prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo1 = tile_idx1 * BATCH
+                    tile_resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm1 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms1 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i81 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2b",
+                    ):
+                        tile_resid1 = pl.assemble(
+                            tile_resid1,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm1 = pl.assemble(
+                            tile_post_norm1,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms1 = pl.assemble(
+                            tile_inv_rms1,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i81 = pl.assemble(
+                            tile_x_i81,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale1 = pl.assemble(
+                            tile_x_scale1,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo1, 0]),
+                            [0, 0],
+                        )
 
-                # DIAG (bisect gate): replicated top-K selection + weights.
-                # DIAG: accumulate gate top-K into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
-                    # expert_indices_dump = pl.assemble(
-                        # expert_indices_dump,
-                        # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                    # expert_weights_dump = pl.assemble(
-                        # expert_weights_dump,
-                        # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
-                sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                sh_y = self.expert_shared_step(
-                    tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-                )
-                self.moe_tp_all_reduce(
-                    sh_y, sh_tmp_window,
-                    pl.slice(
-                        sh_signal_window, [tp_size, 1],
-                        [tile_idx * tp_size, 0],
-                    ),
-                    my_rank,
-                )
+                    # 1) Gate (local, replicated).
+                    expert_indices1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights1 = self.gate_step(
+                        tile_resid1, post_rms_weight, norm_layer_idx, tile_inv_rms1,
+                        gate_w, router_bias,
+                        expert_indices1, expert_weights1,
+                    )
 
-                # DIAG (bisect shared): TP-reduced shared-expert output.
-                # DIAG: accumulate TP-reduced shared-expert output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
-                    # for kb1 in pl.range(HIDDEN // K_CHUNK):
-                        # k01 = kb1 * K_CHUNK
-                        # sh_y_dump = pl.assemble(
-                            # sh_y_dump,
-                            # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
-                            # [t_lo, k01],
+                    sh_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y1 = self.expert_shared_step(
+                        tile_post_norm1, w_gate_s, w_up_s, w_down_s, sh_y1,
+                    )
+                    # 3) Grouped shared-expert TP-AR (P2): one
+                    # barrier round + burst reduce for BOTH
+                    # tiles (each row's FP32 summation order is
+                    # unchanged — moe_tp_all_reduce_group).
+                    sh_y0, sh_y1 = self.moe_tp_all_reduce_group(
+                        sh_y0, sh_y1, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [pair_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+                    # -- Tile A tail: serialize -> dispatch ->
+                    # routed -> combine -> assemble. ─────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale0 (see _serialize_after_shared).
+                    tile_x_scale_ser0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale0 = self._serialize_after_shared(
+                        tile_x_scale0, sh_y0, tile_x_scale_ser0,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile0 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx0 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile0 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile0 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile0 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile0 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile0 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx0 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile0 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx0 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale0 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile0, send_scale_buf_tile0,
+                        recv_x_tile0, recv_scale_tile0,
+                    )
+                    (
+                        local_routed_x0,
+                        local_routed_x_scale0,
+                        local_expert_offset0,
+                        local_expert_count0,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i80, tile_x_scale0, expert_indices0,
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        send_buf_tile0, send_scale_buf_tile0,
+                        pub_counts_tile0,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        recv_x_tile0, recv_scale_tile0,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y0 = self.expert_routed_step_swiglu7(
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y0,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y0 add).
+                    tile_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig0 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig0 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    tile_y0 = self.moe_combine_step(
+                        local_routed_y0,
+                        expert_indices0, expert_weights0, sh_y0,
+                        tile_y0,
+                        pub_counts_tile0, src_route_table_tile0,
+                        route_pub_tile_sig0,
+                        routed_y_buf_tile0,
+                        combine_done_tile_sig0,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2a",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y0, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo0, 0],
+                        )
+
+                    # -- Tile B tail (same sequence). ────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale1 (see _serialize_after_shared).
+                    tile_x_scale_ser1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale1 = self._serialize_after_shared(
+                        tile_x_scale1, sh_y1, tile_x_scale_ser1,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile1 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx1 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile1 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile1 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile1 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile1 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile1 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx1 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile1 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx1 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale1 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile1, send_scale_buf_tile1,
+                        recv_x_tile1, recv_scale_tile1,
+                    )
+                    (
+                        local_routed_x1,
+                        local_routed_x_scale1,
+                        local_expert_offset1,
+                        local_expert_count1,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i81, tile_x_scale1, expert_indices1,
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        send_buf_tile1, send_scale_buf_tile1,
+                        pub_counts_tile1,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        recv_x_tile1, recv_scale_tile1,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y1 = self.expert_routed_step_swiglu7(
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y1,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y1 add).
+                    tile_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig1 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig1 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    tile_y1 = self.moe_combine_step(
+                        local_routed_y1,
+                        expert_indices1, expert_weights1, sh_y1,
+                        tile_y1,
+                        pub_counts_tile1, src_route_table_tile1,
+                        route_pub_tile_sig1,
+                        routed_y_buf_tile1,
+                        combine_done_tile_sig1,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2b",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y1, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo1, 0],
+                        )
+
+            else:
+                for tile_idx in pl.range(PREFILL_TILE_COUNT):
+                    t_lo = tile_idx * BATCH
+                    tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in",
+                    ):
+                        tile_resid = pl.assemble(
+                            tile_resid,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm = pl.assemble(
+                            tile_post_norm,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms = pl.assemble(
+                            tile_inv_rms,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i8 = pl.assemble(
+                            tile_x_i8,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale = pl.assemble(
+                            tile_x_scale,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights = self.gate_step(
+                        tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
+                        gate_w, router_bias,
+                        expert_indices, expert_weights,
+                    )
+
+                    # DIAG (bisect gate): replicated top-K selection + weights.
+                    # DIAG: accumulate gate top-K into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
+                        # expert_indices_dump = pl.assemble(
+                            # expert_indices_dump,
+                            # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # Serialize shared TP -> routed dispatch so dispatch reads the
-                # completed tile_x_scale (see _serialize_after_shared).
-                tile_x_scale_ser = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                tile_x_scale = self._serialize_after_shared(
-                    tile_x_scale, sh_y, tile_x_scale_ser,
-                )
-                # NaN DIAG: producer send-side dequant scale (pre-dispatch).
-
-                # Per-tile data-window views (Orchestration scope): the 5 EP
-                # data windows are shared across the 8-tile unroll, so slice a
-                # fresh per-tile view to stop tile i+1's zero/push from racing
-                # tile i's gather (same per-tile scheme as the signal windows).
-                pub_counts_tile = pl.slice(
-                    pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
-                    [tile_idx * N_RANKS * N_RANKS, 0],
-                )
-                send_buf_tile = pl.slice(
-                    send_buf, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                send_scale_buf_tile = pl.slice(
-                    send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 1): packed send-side scale window.
-                recv_x_tile = pl.slice(
-                    recv_x, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                recv_scale_tile = pl.slice(
-                    recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
-                src_route_table_tile = pl.slice(
-                    src_route_table,
-                    [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
-                    [tile_idx * N_RANKS, 0, 0],
-                )
-                routed_y_buf_tile = pl.slice(
-                    routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
-                    [tile_idx * N_ROUTES_PER_RANK, 0],
-                )
-
-                # 3) Dispatch (EP all-to-all).
-                local_routed_x = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
-                )
-                local_routed_x_scale = pl.create_tensor(
-                    [1, LOCAL_RECV_MAX], dtype=pl.FP32,
-                )
-                local_expert_offset = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                local_expert_count = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                self.zero_dispatch_buffers_step(
-                    send_buf_tile, send_scale_buf_tile,
-                    recv_x_tile, recv_scale_tile,
-                )
-                (
-                    local_routed_x,
-                    local_routed_x_scale,
-                    local_expert_offset,
-                    local_expert_count,
-                ) = self.moe_dispatch_step(
-                    tile_x_i8, tile_x_scale, expert_indices,
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    send_buf_tile, send_scale_buf_tile,
-                    pub_counts_tile,
-                    pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    recv_x_tile, recv_scale_tile,
-                    pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    my_rank,
-                )
-                # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
-                # DIAG: accumulate per-token dequant scale into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
-                    # local_routed_x_scale_dump = pl.assemble(
-                        # local_routed_x_scale_dump,
-                        # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
-                        # [0, tile_idx * N_ROUTES_PER_RANK],
-                    # )
-                # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
-                # DIAG: accumulate reordered routed input into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
-                    # for kb_x in pl.range(HIDDEN // K_CHUNK):
-                        # kx0 = kb_x * K_CHUNK
-                        # local_routed_x_dump = pl.assemble(
-                            # local_routed_x_dump,
-                            # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                        # expert_weights_dump = pl.assemble(
+                            # expert_weights_dump,
+                            # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # 4) Routed experts (local 36).
-                local_routed_y = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
-                )
-                local_routed_y = self.expert_routed_step_swiglu7(
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    w_gate_r, w_gate_r_scale,
-                    w_up_r, w_up_r_scale,
-                    w_down_r, w_down_r_scale,
-                    local_routed_y,
-                )
-
-                # DIAG (bisect routed): per-local-expert output pre-combine.
-                # DIAG: accumulate routed expert output into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
-                    # for kb_y in pl.range(HIDDEN // K_CHUNK):
-                        # ky0 = kb_y * K_CHUNK
-                        # local_routed_y_dump = pl.assemble(
-                            # local_routed_y_dump,
-                            # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, ky0],
-                        # )
-
-                # 5) Combine (EP a2a back + weighted gather + sh_y add).
-                tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                # Bind per-tile signal slices to named DistributedTensor views
-                # at Orchestration scope before the Inline combine step inlines
-                # them: an inline pl.slice(...) arg would splice into the
-                # route_pub barrier's CORE_GROUP scope, where
-                # ConvertTensorToTileOps demotes it to a TileType and
-                # pld.system.notify rejects it (must stay window-bound).
-                route_pub_tile_sig = pl.slice(
-                    route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                combine_done_tile_sig = pl.slice(
-                    combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                tile_y = self.moe_combine_step(
-                    local_routed_y,
-                    expert_indices, expert_weights, sh_y,
-                    tile_y,
-                    pub_counts_tile, src_route_table_tile,
-                    route_pub_tile_sig,
-                    routed_y_buf_tile,
-                    combine_done_tile_sig,
-                    my_rank,
-                )
-                # NaN DIAG: combined MoE output — should be TP-replicated.
-                # DIAG: accumulate combined MoE tile output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
-                    # for kb2 in pl.range(HIDDEN // K_CHUNK):
-                        # k02 = kb2 * K_CHUNK
-                        # tile_y_dump = pl.assemble(
-                            # tile_y_dump,
-                            # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
-                            # [t_lo, k02],
-                        # )
-
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_out",
-                ):
-                    moe_out = pl.assemble(
-                        moe_out,
-                        pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
-                        [t_lo, 0],
+                    # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+                    sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y = self.expert_shared_step(
+                        tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
                     )
+                    self.moe_tp_all_reduce(
+                        sh_y, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [tile_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+
+                    # DIAG (bisect shared): TP-reduced shared-expert output.
+                    # DIAG: accumulate TP-reduced shared-expert output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
+                        # for kb1 in pl.range(HIDDEN // K_CHUNK):
+                            # k01 = kb1 * K_CHUNK
+                            # sh_y_dump = pl.assemble(
+                                # sh_y_dump,
+                                # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
+                                # [t_lo, k01],
+                            # )
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale (see _serialize_after_shared).
+                    tile_x_scale_ser = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale = self._serialize_after_shared(
+                        tile_x_scale, sh_y, tile_x_scale_ser,
+                    )
+                    # NaN DIAG: producer send-side dequant scale (pre-dispatch).
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 1): packed send-side scale window.
+                    recv_x_tile = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
+                    src_route_table_tile = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile, send_scale_buf_tile,
+                        recv_x_tile, recv_scale_tile,
+                    )
+                    (
+                        local_routed_x,
+                        local_routed_x_scale,
+                        local_expert_offset,
+                        local_expert_count,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i8, tile_x_scale, expert_indices,
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        send_buf_tile, send_scale_buf_tile,
+                        pub_counts_tile,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        recv_x_tile, recv_scale_tile,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        my_rank,
+                    )
+                    # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
+                    # DIAG: accumulate per-token dequant scale into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
+                        # local_routed_x_scale_dump = pl.assemble(
+                            # local_routed_x_scale_dump,
+                            # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
+                            # [0, tile_idx * N_ROUTES_PER_RANK],
+                        # )
+                    # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
+                    # DIAG: accumulate reordered routed input into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
+                        # for kb_x in pl.range(HIDDEN // K_CHUNK):
+                            # kx0 = kb_x * K_CHUNK
+                            # local_routed_x_dump = pl.assemble(
+                                # local_routed_x_dump,
+                                # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                            # )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y = self.expert_routed_step_swiglu7(
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y,
+                    )
+
+                    # DIAG (bisect routed): per-local-expert output pre-combine.
+                    # DIAG: accumulate routed expert output into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
+                        # for kb_y in pl.range(HIDDEN // K_CHUNK):
+                            # ky0 = kb_y * K_CHUNK
+                            # local_routed_y_dump = pl.assemble(
+                                # local_routed_y_dump,
+                                # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, ky0],
+                            # )
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y add).
+                    tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    tile_y = self.moe_combine_step(
+                        local_routed_y,
+                        expert_indices, expert_weights, sh_y,
+                        tile_y,
+                        pub_counts_tile, src_route_table_tile,
+                        route_pub_tile_sig,
+                        routed_y_buf_tile,
+                        combine_done_tile_sig,
+                        my_rank,
+                    )
+                    # NaN DIAG: combined MoE output — should be TP-replicated.
+                    # DIAG: accumulate combined MoE tile output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
+                        # for kb2 in pl.range(HIDDEN // K_CHUNK):
+                            # k02 = kb2 * K_CHUNK
+                            # tile_y_dump = pl.assemble(
+                                # tile_y_dump,
+                                # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
+                                # [t_lo, k02],
+                            # )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo, 0],
+                        )
 
             # Module dump 8: ffn_output (combined shared+routed MoE output,
             # pre-residual-add, TP-replicated).
@@ -3894,10 +5241,10 @@ def _build_prefill_fwd_program(
                 [tp_size, 1], pl.INT32
             ],
             sh_tmp_window: pld.DistributedTensor[
-                [BATCH, HIDDEN], pl.BF16
+                [SH_TMP_ROWS, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
-                [PREFILL_TILE_COUNT * tp_size, 1], pl.INT32
+                [SH_GROUP_COUNT * tp_size, 1], pl.INT32
             ],
             pub_counts: pld.DistributedTensor[
                 [PREFILL_TILE_COUNT * N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
@@ -4142,264 +5489,670 @@ def _build_prefill_fwd_program(
             moe_out = pl.create_tensor(
                 [PREFILL_T, HIDDEN], dtype=pl.BF16,
             )
-            for tile_idx in pl.range(PREFILL_TILE_COUNT):
-                t_lo = tile_idx * BATCH
-                tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                tile_post_norm = pl.create_tensor(
-                    [BATCH, HIDDEN], dtype=pl.BF16,
-                )
-                tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-                tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-                tile_x_scale = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_in",
-                ):
-                    tile_resid = pl.assemble(
-                        tile_resid,
-                        pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+            if PREFILL_AR_GROUP == 2:
+                # P2 paired path (PREFILL_AR_GROUP == 2,
+                # p2_proposal.md §3.2): two tiles share ONE
+                # barrier-style shared-expert TP-AR and a
+                # burst reduce. Layout X: each tile's
+                # serialize/.../combine tail runs after the
+                # grouped AR, trading the c(2i)<->s(2i+1)
+                # overlap for a halved barrier count
+                # (pre-registered trade, §4/§6). The
+                # unmerged loop in the else branch is
+                # verbatim modulo indentation (review with
+                # `git diff -w`). DIAG dump blocks omitted;
+                # see the unmerged loop for them.
+                for pair_idx in pl.range(SH_GROUP_COUNT):
+                    tile_idx0 = pair_idx * 2
+                    tile_idx1 = tile_idx0 + 1
+                    # -- Tile A prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo0 = tile_idx0 * BATCH
+                    tile_resid0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm0 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
                     )
-                    tile_post_norm = pl.assemble(
-                        tile_post_norm,
-                        pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    tile_inv_rms0 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i80 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
                     )
-                    tile_inv_rms = pl.assemble(
-                        tile_inv_rms,
-                        pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
-                        [0, 0],
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2a",
+                    ):
+                        tile_resid0 = pl.assemble(
+                            tile_resid0,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm0 = pl.assemble(
+                            tile_post_norm0,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms0 = pl.assemble(
+                            tile_inv_rms0,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i80 = pl.assemble(
+                            tile_x_i80,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo0, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale0 = pl.assemble(
+                            tile_x_scale0,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo0, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
                     )
-                    tile_x_i8 = pl.assemble(
-                        tile_x_i8,
-                        pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
                     )
-                    tile_x_scale = pl.assemble(
-                        tile_x_scale,
-                        pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
-                        [0, 0],
+                    expert_weights0 = self.gate_step(
+                        tile_resid0, post_rms_weight, norm_layer_idx, tile_inv_rms0,
+                        gate_w, router_bias,
+                        expert_indices0, expert_weights0,
                     )
 
-                # 1) Gate (local, replicated).
-                expert_indices = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.INT32,
-                )
-                expert_weights = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.FP32,
-                )
-                expert_weights = self.gate_step(
-                    tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
-                    gate_w, router_bias,
-                    expert_indices, expert_weights,
-                )
+                    sh_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y0 = self.expert_shared_step_swiglu16(
+                        tile_post_norm0, w_gate_s, w_up_s, w_down_s, sh_y0,
+                    )
+                    # -- Tile B prologue: assemble / gate /
+                    # shared GEMM (partial). ────────────────
+                    t_lo1 = tile_idx1 * BATCH
+                    tile_resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm1 = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms1 = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i81 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in_g2b",
+                    ):
+                        tile_resid1 = pl.assemble(
+                            tile_resid1,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm1 = pl.assemble(
+                            tile_post_norm1,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms1 = pl.assemble(
+                            tile_inv_rms1,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i81 = pl.assemble(
+                            tile_x_i81,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo1, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale1 = pl.assemble(
+                            tile_x_scale1,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo1, 0]),
+                            [0, 0],
+                        )
 
-                # DIAG (bisect gate): replicated top-K selection + weights.
-                # DIAG: accumulate gate top-K into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
-                    # expert_indices_dump = pl.assemble(
-                        # expert_indices_dump,
-                        # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                    # expert_weights_dump = pl.assemble(
-                        # expert_weights_dump,
-                        # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
-                        # [t_lo, 0],
-                    # )
-                # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
-                sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                sh_y = self.expert_shared_step_swiglu16(
-                    tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-                )
-                self.moe_tp_all_reduce(
-                    sh_y, sh_tmp_window,
-                    pl.slice(
-                        sh_signal_window, [tp_size, 1],
-                        [tile_idx * tp_size, 0],
-                    ),
-                    my_rank,
-                )
+                    # 1) Gate (local, replicated).
+                    expert_indices1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights1 = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights1 = self.gate_step(
+                        tile_resid1, post_rms_weight, norm_layer_idx, tile_inv_rms1,
+                        gate_w, router_bias,
+                        expert_indices1, expert_weights1,
+                    )
 
-                # DIAG (bisect shared): TP-reduced shared-expert output.
-                # DIAG: accumulate TP-reduced shared-expert output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
-                    # for kb1 in pl.range(HIDDEN // K_CHUNK):
-                        # k01 = kb1 * K_CHUNK
-                        # sh_y_dump = pl.assemble(
-                            # sh_y_dump,
-                            # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
-                            # [t_lo, k01],
+                    sh_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y1 = self.expert_shared_step_swiglu16(
+                        tile_post_norm1, w_gate_s, w_up_s, w_down_s, sh_y1,
+                    )
+                    # 3) Grouped shared-expert TP-AR (P2): one
+                    # barrier round + burst reduce for BOTH
+                    # tiles (each row's FP32 summation order is
+                    # unchanged — moe_tp_all_reduce_group).
+                    sh_y0, sh_y1 = self.moe_tp_all_reduce_group(
+                        sh_y0, sh_y1, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [pair_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+                    # -- Tile A tail: serialize -> dispatch ->
+                    # routed -> combine -> assemble. ─────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale0 (see _serialize_after_shared).
+                    tile_x_scale_ser0 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale0 = self._serialize_after_shared(
+                        tile_x_scale0, sh_y0, tile_x_scale_ser0,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile0 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx0 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile0 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile0 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile0 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile0 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx0 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile0 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx0 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile0 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx0 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale0 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count0 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile0, send_scale_buf_tile0,
+                        recv_x_tile0, recv_scale_tile0,
+                    )
+                    (
+                        local_routed_x0,
+                        local_routed_x_scale0,
+                        local_expert_offset0,
+                        local_expert_count0,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i80, tile_x_scale0, expert_indices0,
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        send_buf_tile0, send_scale_buf_tile0,
+                        pub_counts_tile0,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        recv_x_tile0, recv_scale_tile0,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y0 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y0 = self.expert_routed_step_swiglu7(
+                        local_routed_x0, local_routed_x_scale0,
+                        local_expert_offset0, local_expert_count0,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y0,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y0 add).
+                    tile_y0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig0 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig0 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx0 * N_RANKS, 0],
+                    )
+                    tile_y0 = self.moe_combine_step(
+                        local_routed_y0,
+                        expert_indices0, expert_weights0, sh_y0,
+                        tile_y0,
+                        pub_counts_tile0, src_route_table_tile0,
+                        route_pub_tile_sig0,
+                        routed_y_buf_tile0,
+                        combine_done_tile_sig0,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2a",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y0, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo0, 0],
+                        )
+
+                    # -- Tile B tail (same sequence). ────────
+
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale1 (see _serialize_after_shared).
+                    tile_x_scale_ser1 = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale1 = self._serialize_after_shared(
+                        tile_x_scale1, sh_y1, tile_x_scale_ser1,
+                    )
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile1 = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx1 * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile1 = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile1 = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_x_tile1 = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile1 = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx1 * LOCAL_RECV_MAX, 0],
+                    )
+                    src_route_table_tile1 = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx1 * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile1 = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx1 * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale1 = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count1 = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile1, send_scale_buf_tile1,
+                        recv_x_tile1, recv_scale_tile1,
+                    )
+                    (
+                        local_routed_x1,
+                        local_routed_x_scale1,
+                        local_expert_offset1,
+                        local_expert_count1,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i81, tile_x_scale1, expert_indices1,
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        send_buf_tile1, send_scale_buf_tile1,
+                        pub_counts_tile1,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        recv_x_tile1, recv_scale_tile1,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0]),
+                        my_rank,
+                    )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y1 = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y1 = self.expert_routed_step_swiglu7(
+                        local_routed_x1, local_routed_x_scale1,
+                        local_expert_offset1, local_expert_count1,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y1,
+                    )
+
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y1 add).
+                    tile_y1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig1 = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig1 = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx1 * N_RANKS, 0],
+                    )
+                    tile_y1 = self.moe_combine_step(
+                        local_routed_y1,
+                        expert_indices1, expert_weights1, sh_y1,
+                        tile_y1,
+                        pub_counts_tile1, src_route_table_tile1,
+                        route_pub_tile_sig1,
+                        routed_y_buf_tile1,
+                        combine_done_tile_sig1,
+                        my_rank,
+                    )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out_g2b",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y1, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo1, 0],
+                        )
+
+            else:
+                for tile_idx in pl.range(PREFILL_TILE_COUNT):
+                    t_lo = tile_idx * BATCH
+                    tile_resid = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    tile_post_norm = pl.create_tensor(
+                        [BATCH, HIDDEN], dtype=pl.BF16,
+                    )
+                    tile_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+                    tile_x_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+                    tile_x_scale = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_in",
+                    ):
+                        tile_resid = pl.assemble(
+                            tile_resid,
+                            pl.slice(resid1, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_post_norm = pl.assemble(
+                            tile_post_norm,
+                            pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_inv_rms = pl.assemble(
+                            tile_inv_rms,
+                            pl.slice(moe_inv_rms, [BATCH, 1], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_i8 = pl.assemble(
+                            tile_x_i8,
+                            pl.slice(x_i8, [BATCH, HIDDEN], [t_lo, 0]),
+                            [0, 0],
+                        )
+                        tile_x_scale = pl.assemble(
+                            tile_x_scale,
+                            pl.slice(x_scale, [BATCH, SCALE_W_PAD], [t_lo, 0]),
+                            [0, 0],
+                        )
+
+                    # 1) Gate (local, replicated).
+                    expert_indices = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.INT32,
+                    )
+                    expert_weights = pl.create_tensor(
+                        [BATCH, TOPK], dtype=pl.FP32,
+                    )
+                    expert_weights = self.gate_step(
+                        tile_resid, post_rms_weight, norm_layer_idx, tile_inv_rms,
+                        gate_w, router_bias,
+                        expert_indices, expert_weights,
+                    )
+
+                    # DIAG (bisect gate): replicated top-K selection + weights.
+                    # DIAG: accumulate gate top-K into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_gate_dump"):
+                        # expert_indices_dump = pl.assemble(
+                            # expert_indices_dump,
+                            # pl.slice(expert_indices, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # Serialize shared TP -> routed dispatch so dispatch reads the
-                # completed tile_x_scale (see _serialize_after_shared).
-                tile_x_scale_ser = pl.create_tensor(
-                    [BATCH, SCALE_W_PAD], dtype=pl.FP32,
-                )
-                tile_x_scale = self._serialize_after_shared(
-                    tile_x_scale, sh_y, tile_x_scale_ser,
-                )
-                # NaN DIAG: producer send-side dequant scale (pre-dispatch).
-
-                # Per-tile data-window views (Orchestration scope): the 5 EP
-                # data windows are shared across the 8-tile unroll, so slice a
-                # fresh per-tile view to stop tile i+1's zero/push from racing
-                # tile i's gather (same per-tile scheme as the signal windows).
-                pub_counts_tile = pl.slice(
-                    pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
-                    [tile_idx * N_RANKS * N_RANKS, 0],
-                )
-                send_buf_tile = pl.slice(
-                    send_buf, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                send_scale_buf_tile = pl.slice(
-                    send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 1): packed send-side scale window.
-                recv_x_tile = pl.slice(
-                    recv_x, [LOCAL_RECV_MAX, HIDDEN],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                recv_scale_tile = pl.slice(
-                    recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
-                    [tile_idx * LOCAL_RECV_MAX, 0],
-                )
-                # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
-                src_route_table_tile = pl.slice(
-                    src_route_table,
-                    [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
-                    [tile_idx * N_RANKS, 0, 0],
-                )
-                routed_y_buf_tile = pl.slice(
-                    routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
-                    [tile_idx * N_ROUTES_PER_RANK, 0],
-                )
-
-                # 3) Dispatch (EP all-to-all).
-                local_routed_x = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
-                )
-                local_routed_x_scale = pl.create_tensor(
-                    [1, LOCAL_RECV_MAX], dtype=pl.FP32,
-                )
-                local_expert_offset = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                local_expert_count = pl.create_tensor(
-                    [N_LOCAL_EXPERTS], dtype=pl.INT32,
-                )
-                self.zero_dispatch_buffers_step(
-                    send_buf_tile, send_scale_buf_tile,
-                    recv_x_tile, recv_scale_tile,
-                )
-                (
-                    local_routed_x,
-                    local_routed_x_scale,
-                    local_expert_offset,
-                    local_expert_count,
-                ) = self.moe_dispatch_step(
-                    tile_x_i8, tile_x_scale, expert_indices,
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    send_buf_tile, send_scale_buf_tile,
-                    pub_counts_tile,
-                    pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    recv_x_tile, recv_scale_tile,
-                    pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
-                    my_rank,
-                )
-                # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
-                # DIAG: accumulate per-token dequant scale into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
-                    # local_routed_x_scale_dump = pl.assemble(
-                        # local_routed_x_scale_dump,
-                        # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
-                        # [0, tile_idx * N_ROUTES_PER_RANK],
-                    # )
-                # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
-                # DIAG: accumulate reordered routed input into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
-                    # for kb_x in pl.range(HIDDEN // K_CHUNK):
-                        # kx0 = kb_x * K_CHUNK
-                        # local_routed_x_dump = pl.assemble(
-                            # local_routed_x_dump,
-                            # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                        # expert_weights_dump = pl.assemble(
+                            # expert_weights_dump,
+                            # pl.slice(expert_weights, [BATCH, TOPK], [0, 0]),
+                            # [t_lo, 0],
                         # )
-
-                # 4) Routed experts (local 36).
-                local_routed_y = pl.create_tensor(
-                    [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
-                )
-                local_routed_y = self.expert_routed_step_swiglu7(
-                    local_routed_x, local_routed_x_scale,
-                    local_expert_offset, local_expert_count,
-                    w_gate_r, w_gate_r_scale,
-                    w_up_r, w_up_r_scale,
-                    w_down_r, w_down_r_scale,
-                    local_routed_y,
-                )
-
-                # DIAG (bisect routed): per-local-expert output pre-combine.
-                # DIAG: accumulate routed expert output into host-visible dump.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
-                    # for kb_y in pl.range(HIDDEN // K_CHUNK):
-                        # ky0 = kb_y * K_CHUNK
-                        # local_routed_y_dump = pl.assemble(
-                            # local_routed_y_dump,
-                            # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
-                            # [tile_idx * N_ROUTES_PER_RANK, ky0],
-                        # )
-
-                # 5) Combine (EP a2a back + weighted gather + sh_y add).
-                tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-                # Bind per-tile signal slices to named DistributedTensor views
-                # at Orchestration scope before the Inline combine step inlines
-                # them: an inline pl.slice(...) arg would splice into the
-                # route_pub barrier's CORE_GROUP scope, where
-                # ConvertTensorToTileOps demotes it to a TileType and
-                # pld.system.notify rejects it (must stay window-bound).
-                route_pub_tile_sig = pl.slice(
-                    route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                combine_done_tile_sig = pl.slice(
-                    combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
-                )
-                tile_y = self.moe_combine_step(
-                    local_routed_y,
-                    expert_indices, expert_weights, sh_y,
-                    tile_y,
-                    pub_counts_tile, src_route_table_tile,
-                    route_pub_tile_sig,
-                    routed_y_buf_tile,
-                    combine_done_tile_sig,
-                    my_rank,
-                )
-                # NaN DIAG: combined MoE output — should be TP-replicated.
-                # DIAG: accumulate combined MoE tile output.
-                # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
-                    # for kb2 in pl.range(HIDDEN // K_CHUNK):
-                        # k02 = kb2 * K_CHUNK
-                        # tile_y_dump = pl.assemble(
-                            # tile_y_dump,
-                            # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
-                            # [t_lo, k02],
-                        # )
-
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_out",
-                ):
-                    moe_out = pl.assemble(
-                        moe_out,
-                        pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
-                        [t_lo, 0],
+                    # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+                    sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_y = self.expert_shared_step_swiglu16(
+                        tile_post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
                     )
+                    self.moe_tp_all_reduce(
+                        sh_y, sh_tmp_window,
+                        pl.slice(
+                            sh_signal_window, [tp_size, 1],
+                            [tile_idx * tp_size, 0],
+                        ),
+                        my_rank,
+                    )
+
+                    # DIAG (bisect shared): TP-reduced shared-expert output.
+                    # DIAG: accumulate TP-reduced shared-expert output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_sh_y_dump"):
+                        # for kb1 in pl.range(HIDDEN // K_CHUNK):
+                            # k01 = kb1 * K_CHUNK
+                            # sh_y_dump = pl.assemble(
+                                # sh_y_dump,
+                                # pl.slice(sh_y, [BATCH, K_CHUNK], [0, k01]),
+                                # [t_lo, k01],
+                            # )
+
+                    # Serialize shared TP -> routed dispatch so dispatch reads the
+                    # completed tile_x_scale (see _serialize_after_shared).
+                    tile_x_scale_ser = pl.create_tensor(
+                        [BATCH, SCALE_W_PAD], dtype=pl.FP32,
+                    )
+                    tile_x_scale = self._serialize_after_shared(
+                        tile_x_scale, sh_y, tile_x_scale_ser,
+                    )
+                    # NaN DIAG: producer send-side dequant scale (pre-dispatch).
+
+                    # Per-tile data-window views (Orchestration scope): the 5 EP
+                    # data windows are shared across the 8-tile unroll, so slice a
+                    # fresh per-tile view to stop tile i+1's zero/push from racing
+                    # tile i's gather (same per-tile scheme as the signal windows).
+                    pub_counts_tile = pl.slice(
+                        pub_counts, [N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
+                        [tile_idx * N_RANKS * N_RANKS, 0],
+                    )
+                    send_buf_tile = pl.slice(
+                        send_buf, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    send_scale_buf_tile = pl.slice(
+                        send_scale_buf, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 1): packed send-side scale window.
+                    recv_x_tile = pl.slice(
+                        recv_x, [LOCAL_RECV_MAX, HIDDEN],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    recv_scale_tile = pl.slice(
+                        recv_scale, [LOCAL_RECV_MAX, SCALE_W_PAD],
+                        [tile_idx * LOCAL_RECV_MAX, 0],
+                    )
+                    # NaN DIAG (stage 2): a2a-delivered recv-side scale window.
+                    src_route_table_tile = pl.slice(
+                        src_route_table,
+                        [N_RANKS, N_LOCAL_EXPERTS, N_ROUTES_PER_RANK],
+                        [tile_idx * N_RANKS, 0, 0],
+                    )
+                    routed_y_buf_tile = pl.slice(
+                        routed_y_buf, [N_ROUTES_PER_RANK, HIDDEN],
+                        [tile_idx * N_ROUTES_PER_RANK, 0],
+                    )
+
+                    # 3) Dispatch (EP all-to-all).
+                    local_routed_x = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                    )
+                    local_routed_x_scale = pl.create_tensor(
+                        [1, LOCAL_RECV_MAX], dtype=pl.FP32,
+                    )
+                    local_expert_offset = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    local_expert_count = pl.create_tensor(
+                        [N_LOCAL_EXPERTS], dtype=pl.INT32,
+                    )
+                    self.zero_dispatch_buffers_step(
+                        send_buf_tile, send_scale_buf_tile,
+                        recv_x_tile, recv_scale_tile,
+                    )
+                    (
+                        local_routed_x,
+                        local_routed_x_scale,
+                        local_expert_offset,
+                        local_expert_count,
+                    ) = self.moe_dispatch_step(
+                        tile_x_i8, tile_x_scale, expert_indices,
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        send_buf_tile, send_scale_buf_tile,
+                        pub_counts_tile,
+                        pl.slice(count_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        recv_x_tile, recv_scale_tile,
+                        pl.slice(data_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0]),
+                        my_rank,
+                    )
+                    # NaN DIAG (candidate ①): per-token activation scale post-dispatch.
+                    # DIAG: accumulate per-token dequant scale into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_scale_dump"):
+                        # local_routed_x_scale_dump = pl.assemble(
+                            # local_routed_x_scale_dump,
+                            # pl.slice(local_routed_x_scale, [1, N_ROUTES_PER_RANK], [0, 0]),
+                            # [0, tile_idx * N_ROUTES_PER_RANK],
+                        # )
+                    # DIAG (bisect dispatch): reordered INT8 x post-a2a (recv_x equiv).
+                    # DIAG: accumulate reordered routed input into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_x_dump"):
+                        # for kb_x in pl.range(HIDDEN // K_CHUNK):
+                            # kx0 = kb_x * K_CHUNK
+                            # local_routed_x_dump = pl.assemble(
+                                # local_routed_x_dump,
+                                # pl.slice(local_routed_x, [N_ROUTES_PER_RANK, K_CHUNK], [0, kx0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, kx0],
+                            # )
+
+                    # 4) Routed experts (local 36).
+                    local_routed_y = pl.create_tensor(
+                        [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    )
+                    local_routed_y = self.expert_routed_step_swiglu7(
+                        local_routed_x, local_routed_x_scale,
+                        local_expert_offset, local_expert_count,
+                        w_gate_r, w_gate_r_scale,
+                        w_up_r, w_up_r_scale,
+                        w_down_r, w_down_r_scale,
+                        local_routed_y,
+                    )
+
+                    # DIAG (bisect routed): per-local-expert output pre-combine.
+                    # DIAG: accumulate routed expert output into host-visible dump.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_routed_y_dump"):
+                        # for kb_y in pl.range(HIDDEN // K_CHUNK):
+                            # ky0 = kb_y * K_CHUNK
+                            # local_routed_y_dump = pl.assemble(
+                                # local_routed_y_dump,
+                                # pl.slice(local_routed_y, [N_ROUTES_PER_RANK, K_CHUNK], [0, ky0]),
+                                # [tile_idx * N_ROUTES_PER_RANK, ky0],
+                            # )
+
+                    # 5) Combine (EP a2a back + weighted gather + sh_y add).
+                    tile_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                    # Bind per-tile signal slices to named DistributedTensor views
+                    # at Orchestration scope before the Inline combine step inlines
+                    # them: an inline pl.slice(...) arg would splice into the
+                    # route_pub barrier's CORE_GROUP scope, where
+                    # ConvertTensorToTileOps demotes it to a TileType and
+                    # pld.system.notify rejects it (must stay window-bound).
+                    route_pub_tile_sig = pl.slice(
+                        route_pub_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    combine_done_tile_sig = pl.slice(
+                        combine_done_sig, [N_RANKS, 1], [tile_idx * N_RANKS, 0],
+                    )
+                    tile_y = self.moe_combine_step(
+                        local_routed_y,
+                        expert_indices, expert_weights, sh_y,
+                        tile_y,
+                        pub_counts_tile, src_route_table_tile,
+                        route_pub_tile_sig,
+                        routed_y_buf_tile,
+                        combine_done_tile_sig,
+                        my_rank,
+                    )
+                    # NaN DIAG: combined MoE output — should be TP-replicated.
+                    # DIAG: accumulate combined MoE tile output.
+                    # with pl.at(level=pl.Level.CORE_GROUP, name_hint="diag_tile_y_dump"):
+                        # for kb2 in pl.range(HIDDEN // K_CHUNK):
+                            # k02 = kb2 * K_CHUNK
+                            # tile_y_dump = pl.assemble(
+                                # tile_y_dump,
+                                # pl.slice(tile_y, [BATCH, K_CHUNK], [0, k02]),
+                                # [t_lo, k02],
+                            # )
+
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="prefill_moe_tile_out",
+                    ):
+                        moe_out = pl.assemble(
+                            moe_out,
+                            pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
+                            [t_lo, 0],
+                        )
 
             # Module dump 8: ffn_output (combined shared+routed MoE output,
             # pre-residual-add, TP-replicated).
@@ -4570,10 +6323,10 @@ def _build_prefill_fwd_program(
                 [NUM_MOE_LAYERS * tp_size, 1], pl.INT32
             ],
             moe_sh_tmp_stack: pld.DistributedTensor[
-                [NUM_MOE_LAYERS * BATCH, HIDDEN], pl.BF16
+                [NUM_MOE_LAYERS * SH_TMP_ROWS, HIDDEN], pl.BF16
             ],
             moe_sh_signal_stack: pld.DistributedTensor[
-                [NUM_MOE_LAYERS * PREFILL_TILE_COUNT * tp_size, 1], pl.INT32
+                [NUM_MOE_LAYERS * SH_GROUP_COUNT * tp_size, 1], pl.INT32
             ],
             moe_pub_counts: pld.DistributedTensor[
                 [PREFILL_TILE_COUNT * N_RANKS * N_RANKS, N_LOCAL_EXPERTS],
@@ -4775,9 +6528,9 @@ def _build_prefill_fwd_program(
                     moe_r_scale_off = moe_pos * N_LOCAL_EXPERTS
                     moe_sh_down_off = moe_pos * SH_INTER_LOCAL
                     win_off = moe_pos * PREFILL_T
-                    sh_win_off = moe_pos * BATCH
+                    sh_win_off = moe_pos * SH_TMP_ROWS
                     sig_off = moe_pos * tp_size
-                    sh_sig_off = moe_pos * PREFILL_TILE_COUNT * tp_size
+                    sh_sig_off = moe_pos * SH_GROUP_COUNT * tp_size
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
@@ -4836,8 +6589,8 @@ def _build_prefill_fwd_program(
                         k_rot_dump,
                         pl.slice(moe_attn_tmp_stack, [PREFILL_T, HIDDEN], [win_off, 0]),
                         pl.slice(moe_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
-                        pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [sh_win_off, 0]),
-                        pl.slice(moe_sh_signal_stack, [PREFILL_TILE_COUNT * tp_size, 1], [sh_sig_off, 0]),
+                        pl.slice(moe_sh_tmp_stack, [SH_TMP_ROWS, HIDDEN], [sh_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [SH_GROUP_COUNT * tp_size, 1], [sh_sig_off, 0]),
                         moe_pub_counts,
                         pl.slice(moe_count_done_sig, [PREFILL_TILE_COUNT * N_RANKS, 1], [barrier_off, 0]),
                         moe_send_x,
@@ -4867,9 +6620,9 @@ def _build_prefill_fwd_program(
                     moe_r_scale_off = moe_pos * N_LOCAL_EXPERTS
                     moe_sh_down_off = moe_pos * SH_INTER_LOCAL
                     win_off = moe_pos * PREFILL_T
-                    sh_win_off = moe_pos * BATCH
+                    sh_win_off = moe_pos * SH_TMP_ROWS
                     sig_off = moe_pos * tp_size
-                    sh_sig_off = moe_pos * PREFILL_TILE_COUNT * tp_size
+                    sh_sig_off = moe_pos * SH_GROUP_COUNT * tp_size
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
@@ -4933,8 +6686,8 @@ def _build_prefill_fwd_program(
                         scores_dump,
                         pl.slice(moe_attn_tmp_stack, [PREFILL_T, HIDDEN], [win_off, 0]),
                         pl.slice(moe_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
-                        pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [sh_win_off, 0]),
-                        pl.slice(moe_sh_signal_stack, [PREFILL_TILE_COUNT * tp_size, 1], [sh_sig_off, 0]),
+                        pl.slice(moe_sh_tmp_stack, [SH_TMP_ROWS, HIDDEN], [sh_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [SH_GROUP_COUNT * tp_size, 1], [sh_sig_off, 0]),
                         moe_pub_counts,
                         pl.slice(moe_count_done_sig, [PREFILL_TILE_COUNT * N_RANKS, 1], [barrier_off, 0]),
                         moe_send_x,
@@ -4967,9 +6720,9 @@ def _build_prefill_fwd_program(
                     moe_r_scale_off = moe_pos * N_LOCAL_EXPERTS
                     moe_sh_down_off = moe_pos * SH_INTER_LOCAL
                     win_off = moe_pos * PREFILL_T
-                    sh_win_off = moe_pos * BATCH
+                    sh_win_off = moe_pos * SH_TMP_ROWS
                     sig_off = moe_pos * tp_size
-                    sh_sig_off = moe_pos * PREFILL_TILE_COUNT * tp_size
+                    sh_sig_off = moe_pos * SH_GROUP_COUNT * tp_size
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
@@ -5028,8 +6781,8 @@ def _build_prefill_fwd_program(
                         k_rot_dump,
                         pl.slice(moe_attn_tmp_stack, [PREFILL_T, HIDDEN], [win_off, 0]),
                         pl.slice(moe_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
-                        pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [sh_win_off, 0]),
-                        pl.slice(moe_sh_signal_stack, [PREFILL_TILE_COUNT * tp_size, 1], [sh_sig_off, 0]),
+                        pl.slice(moe_sh_tmp_stack, [SH_TMP_ROWS, HIDDEN], [sh_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [SH_GROUP_COUNT * tp_size, 1], [sh_sig_off, 0]),
                         moe_pub_counts,
                         pl.slice(moe_count_done_sig, [PREFILL_TILE_COUNT * N_RANKS, 1], [barrier_off, 0]),
                         moe_send_x,
@@ -5059,9 +6812,9 @@ def _build_prefill_fwd_program(
                     moe_r_scale_off = moe_pos * N_LOCAL_EXPERTS
                     moe_sh_down_off = moe_pos * SH_INTER_LOCAL
                     win_off = moe_pos * PREFILL_T
-                    sh_win_off = moe_pos * BATCH
+                    sh_win_off = moe_pos * SH_TMP_ROWS
                     sig_off = moe_pos * tp_size
-                    sh_sig_off = moe_pos * PREFILL_TILE_COUNT * tp_size
+                    sh_sig_off = moe_pos * SH_GROUP_COUNT * tp_size
                     barrier_off = moe_pos * PREFILL_TILE_COUNT * N_RANKS
                     norm_layer_idx = pl.cast(li, pl.INT32)
                     attn_layer_idx = pl.cast(0, pl.INT32)
@@ -5120,8 +6873,8 @@ def _build_prefill_fwd_program(
                         k_rot_dump,
                         pl.slice(moe_attn_tmp_stack, [PREFILL_T, HIDDEN], [win_off, 0]),
                         pl.slice(moe_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
-                        pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [sh_win_off, 0]),
-                        pl.slice(moe_sh_signal_stack, [PREFILL_TILE_COUNT * tp_size, 1], [sh_sig_off, 0]),
+                        pl.slice(moe_sh_tmp_stack, [SH_TMP_ROWS, HIDDEN], [sh_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [SH_GROUP_COUNT * tp_size, 1], [sh_sig_off, 0]),
                         moe_pub_counts,
                         pl.slice(moe_count_done_sig, [PREFILL_TILE_COUNT * N_RANKS, 1], [barrier_off, 0]),
                         moe_send_x,
@@ -5356,10 +7109,10 @@ def _build_prefill_fwd_program(
                 NUM_MOE_LAYERS * tp_size * 4,
             )
             moe_sh_tmp_buf = pld.alloc_window_buffer(
-                NUM_MOE_LAYERS * BATCH * HIDDEN * 2,
+                NUM_MOE_LAYERS * SH_TMP_ROWS * HIDDEN * 2,
             )
             moe_sh_sig_buf = pld.alloc_window_buffer(
-                NUM_MOE_LAYERS * PREFILL_TILE_COUNT * tp_size * 4,
+                NUM_MOE_LAYERS * SH_GROUP_COUNT * tp_size * 4,
             )
             moe_pub_counts_buf = pld.alloc_window_buffer(
                 PREFILL_TILE_COUNT * N_RANKS * N_RANKS * N_LOCAL_EXPERTS * 4,
@@ -5427,12 +7180,12 @@ def _build_prefill_fwd_program(
                 )
                 moe_sh_tmp_window = pld.window(
                     moe_sh_tmp_buf,
-                    [NUM_MOE_LAYERS * BATCH, HIDDEN],
+                    [NUM_MOE_LAYERS * SH_TMP_ROWS, HIDDEN],
                     dtype=pl.BF16,
                 )
                 moe_sh_signal_window = pld.window(
                     moe_sh_sig_buf,
-                    [NUM_MOE_LAYERS * PREFILL_TILE_COUNT * tp_size, 1],
+                    [NUM_MOE_LAYERS * SH_GROUP_COUNT * tp_size, 1],
                     dtype=pl.INT32,
                 )
                 moe_pub_counts = pld.window(
