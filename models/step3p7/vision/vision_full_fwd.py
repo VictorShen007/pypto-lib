@@ -22,10 +22,9 @@ im2col runs in the host driver (``models/step3p7/vision/vision_full_fwd.py`` via
 ``ds2_im2col_b`` tap-major gather kernels) so the host only does a cheap 1-zero-border
 pad+reshape + a one-time weight permute (channel-major -> tap-major).
 
-Two NEW padded kernels (ds1_pad/ds2_pad) are needed because the original
-``conv_downsample1/2`` are static [676]/[169] with ``n=N//16`` tail bugs; leaving
-the originals untouched, we write padded copies here (N=688/176, mult of 16,
-no tail).
+Two NEW padded kernels (ds1_pad/ds2_pad) are needed because the static
+[676]/[169] shapes with ``n=N//16`` have tail bugs; we write padded copies
+here (N=688/176, mult of 16, no tail).
 
 Usage (host driver orchestrates the chain)::
 
@@ -104,7 +103,7 @@ DS1_RAW_ROWS_B = VB * V_TOKENS                  # 2704*VB
 DS2_RAW_ROWS_B = VB * V_GRID_DS1 * V_GRID_DS1   # 676*VB
 
 
-# ── NEW padded downsampler kernels (copies of conv_downsample1/2, N padded, no tail, +bias) ──
+# ── NEW padded downsampler kernels (N padded to mult-of-16, no tail, +bias) ──
 # spmd restructured from row-groups to N-blocks (patch_embed idiom). Old: spmd
 # over row groups (ds1 43 / ds2 only 11 tasks — ds2 left 70
 # of 81 cores idle) and EVERY row-group task re-read the full weight (ds1 85MB

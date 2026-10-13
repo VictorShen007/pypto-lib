@@ -8,9 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Host-side im2col helpers for the step3p7 vision conv stages.
 
-The pypto conv kernels (``conv_patch.patch_embed``, ``conv_downsample.conv_downsample1/2``)
+The pypto conv kernels (``conv_patch.patch_embed``, ``vision_full_fwd.ds1_pad/ds2_pad``)
 take an **already-im2col'd** GM tensor as input (the kernel only does the matmul;
-im2col is the host's job — see ``conv_patch.py`` / ``conv_downsample.py`` docstrings).
+im2col is the host's job — see ``conv_patch.py`` / ``vision_full_fwd.py`` docstrings).
 Since pypto ``host_orch`` is DSL (no torch), these im2cols run in the **host caller**
 (outside the @pl.program) and feed the result as an input GM tensor.
 
