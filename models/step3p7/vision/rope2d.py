@@ -80,7 +80,7 @@ def apply_2d_rope(
     """Apply interleaved 2D RoPE (vLLM form, DSv4 rope_interleave pattern):
     ``out[j] = qk[j]*cos_il[j] + qk[j^1]*sin_signed[j]``, ``j^1 = j XOR 1``.
 
-    Mirrors the bug-free RoPE in ``vision_fwd.py`` ``vb2_all`` Pass B1 (the
+    Mirrors the bug-free RoPE in ``vision_fwd_repl_os.py`` ``vb2_all_os`` Pass B1 (the
     fix): swap index ``j^1`` built whole-tile [T_TILE,HD] via
     ``col_expand_mul`` + arithmetic, ``pl.gather`` for ``x[j^1]``, then the
     rotation APPLY is done **per-position [1,HD] inside ``pl.range(T_TILE)``**

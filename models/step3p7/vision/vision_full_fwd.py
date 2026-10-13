@@ -8,13 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Step3.7 VIT **full-pipeline** Pypto version (pixel -> image_features).
 
-This is a SEPARATE, self-contained full vision pipeline that does NOT
-modify the original ``vision_fwd.py`` (the 47-layer tower, L3-green). It chains:
+This is a SEPARATE, self-contained full vision pipeline. It chains:
 
-  host im2col(patch) -> patch_embed -> +posemb -> ln_pre -> [tower: Step3p7Vision] ->
+  host im2col(patch) -> patch_embed -> +posemb -> ln_pre -> [47-layer REPL tower] ->
   device im2col(ds1) -> ds1 -> device im2col(ds2) -> ds2 -> projector -> image_features
 
-The tower (Step3p7Vision) is REUSED from ``vision_fwd.py`` (untouched). The front/back
+The tower is the REPLICATED B-axis tower (``Step3p7VisionReplOSChunked`` from
+``vision_fwd_repl_os.py``). The front/back
 stages are new ``@pl.jit`` wrappers around the standalone ``@pl.jit.inline`` kernels
 (patch_embed/layernorm/vit_projector + 2 NEW padded ds1/ds2 kernels). patch_embed's
 im2col runs in the host driver (``models/step3p7/vision/vision_full_fwd.py`` via
@@ -42,7 +42,7 @@ from .vision_config import (
 from .conv_patch import patch_embed, PE_K_PAD, PE_ROWS_PAD
 # pl.inline(<body>._func) inlines the body AST into THIS module's scope, so the
 # cross-module bodies' free vars must be imported here to resolve (same-module
-# bodies in vision_fwd don't hit this). layernorm uses D/D_TILE/T_TILE/
+# bodies don't hit this). layernorm uses D/D_TILE/T_TILE/
 # V_WIDTH_INV/V_EPS; vit_projector uses N. patch_embed's free vars are only
 # its own constants (PE_ROWS_PAD/PE_K_PAD, imported above).
 from .layernorm import (
@@ -665,8 +665,8 @@ def proj_full(
 # @pl.program's 8-card hierarchical init (two 8-card @pl.program launches in one
 # process both PASS, zero SIGSEGV; golden.run
 # tears down chip workers between @pl.program launches). Each stage wraps an
-# existing @pl.jit.inline body via pl.inline(body._func), mirroring vision_fwd
-# ._build: per_rank (plain Orchestration — NOT inline_orchestration; the tower's
+# existing @pl.jit.inline body via pl.inline(body._func), mirroring the tower's
+# _build: per_rank (plain Orchestration — NOT inline_orchestration; the tower's
 # per_rank is the same and calls pl.inline bodies directly at L240/L252) wraps the
 # inline body; host_orch (HOST/Orchestrator) loops pl.range(pld.world_size()) and
 # dispatches per_rank(..., device=r). inline_orchestration is only for leaf
@@ -964,10 +964,6 @@ AllGatherRowsProg = _build_allgather_rows(V_TOKENS_FINAL_PAD, LM_HIDDEN)
 # 6 * V_TOKENS_FINAL_PATCH_PAD (96) = 576 rows (the B6 ProjPatchB6Prog output).
 # Same builder, different row count (576 % 16 == 0, 4096 % 512 == 0).
 AllGatherRowsPatchProg = _build_allgather_rows(6 * V_TOKENS_FINAL_PATCH_PAD, LM_HIDDEN)
-
-
-# Reuse the 47-layer tower from vision_fwd (untouched, L3-green).
-from .vision_fwd import Step3p7Vision  # noqa: E402  (TP=8 @pl.program)
 
 
 # ============================================================================
@@ -1310,8 +1306,8 @@ def main():
     ok = ok and r.passed
 
     # ════════ Stage 4: tower (ln_out → tower_out) — REPLICATED B-axis ════════
-    # The full pipeline switches from the TP8 tower (Step3p7Vision, single-image)
-    # to the REPLICATED B-axis tower (Step3p7VisionReplOSChunked): every card runs
+    # The full pipeline runs the REPLICATED B-axis tower (Step3p7VisionReplOSChunked):
+    # every card runs
     # the full 47-layer transformer over the STACKED-2D [VB*vT, D] input with an
     # `hactive` guard, zero cross-card sync (vLLM's replicated-ViT strategy).
     # Full-tower gate stays loose (atol=1.2e-1 / rtol=8e-2 / 1% max-error-ratio),

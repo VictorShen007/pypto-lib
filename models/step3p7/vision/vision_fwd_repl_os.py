@@ -80,7 +80,7 @@
 #
 # Everything else (v4 split LN/GEMM bodies, vb3, residual adds, chunked
 # host_orch) is copied verbatim from the retired three-phase repl tower. The attention body
-# is defined LOCALLY in this module (not shared via vision_fwd.vb2_all) so
+# is defined LOCALLY in this module so
 # its free variables resolve against this module's full-dim globals without
 # ambiguity; KT here is the flash K-tile (208), unlike the donor module's
 # vestigial local KT=16.
@@ -138,14 +138,14 @@ on_res=D//RES_N;on_res1=KO//RES_N;on_resm=ILP//RES_N  # elementwise-pass chunk c
 # Fused residual epilogues (Phase-A retry at [48,64]): vb3r1_fused / mlp_f2_r2_fused eliminated pbuf/p2buf entirely, so rbb/x1buf ALSO moved to the vTp stride (block 57 must write pad rows, not image b+1's real rows) — ln_fwd reads x at b*vTp (real rows only, tg<169), layer-0's rbb comes from a one-shot cp0 copy of x_in, and wrto reads rbb at b*vTp / writes rto at b*vT. The FixPipe split restores pbuf/p2buf (now the direct-store targets) but KEEPS the rbb/x1buf vTp stride: the resid passes read/write at b*vTp. The epilogue reproduces the pbuf/p2buf values via an on-chip BF16 rint round-trip with the donor r1/r2 add nesting -> bit-identical on all real rows.
 
 # ── ONLINE-SOFTMAX attention body (Phase 1) ──
-# v2r RoPE pass is inlined verbatim from vision_fwd.vb2_all (proven; kept in
+# v2r RoPE pass (proven; kept in
 # the same body — no jit-inline helper calls across the pl.inline splice).
 @pl.jit.inline
 def vb2_all_os(qkv_full:pl.Tensor[[vTpE,KO],pl.BF16],cos:pl.Tensor[[vT,HD],pl.FP32],sin:pl.Tensor[[vT,HD],pl.FP32],attn_ctx:pl.Tensor[[vTpE,DLP],pl.BF16],active:pl.Scalar[pl.INDEX]):
     nk=vT//KT;nqa=vT//MQA
     qr=pl.create_tensor([vTe,DL],dtype=pl.BF16);kr=pl.create_tensor([vTe,DL],dtype=pl.BF16);vp=pl.create_tensor([vTe,DLP],dtype=pl.BF16)
     pe_s=pl.create_tensor([VB*OI,vT],dtype=pl.BF16);mb_s=pl.create_tensor([VB*SL_A*nk,MQA],dtype=pl.FP32);lb_s=pl.create_tensor([VB*SL_A*nk,MQA],dtype=pl.FP32)
-    # v2r: RoPE (verbatim math from vision_fwd.vb2_all, incl. the BUG-0002 zero pad).
+    # v2r: RoPE (proven math, incl. the BUG-0002 zero pad).
     # crop-block merge: spmd((vT//QT)*HL) + serial inner b loop
     # (was spmd(VB*(vT//QT)*HL) with lane-decoded b) — 1 submit either way, but
     # block_num drops VB* (at active=1 the old form drained 18928 idle blocks/

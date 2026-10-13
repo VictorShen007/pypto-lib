@@ -10,10 +10,9 @@
 
 Compiles the full-pipeline version: 5 @pl.jit stage wrappers (patch_embed_full,
 ln_pre_full, ds1_full, ds2_full, proj_full) + 5 replicated @pl.program stages
-(PatchEmbedProg/LnPreProg/Ds1Prog/Ds2Prog/ProjProg, B' fix) + the reused tower
-(Step3p7Vision). @pl.jit stages use ``run_jit(compile_only=True)`` (golden
-harness); the @pl.program stages + tower use ``ir.compile``. Original
-``_compile_vision.py`` untouched.
+(PatchEmbedProg/LnPreProg/Ds1Prog/Ds2Prog/ProjProg, B' fix). @pl.jit stages use
+``run_jit(compile_only=True)`` (golden harness); the @pl.program stages use
+``ir.compile``.
 
 Usage::
 
@@ -34,7 +33,7 @@ from .vision_config import (
 )
 from .vision_full_fwd import (
     patch_embed_full, ln_pre_full, ds1_full, ds2_full, proj_full,
-    Step3p7Vision, V_GRID_DS1_PAD, PE_K_PAD, PE_ROWS_PAD,
+    V_GRID_DS1_PAD, PE_K_PAD, PE_ROWS_PAD,
     PatchEmbedProg, LnPreProg, Ds1Prog, Ds2Prog, ProjProg,
 )
 
@@ -108,22 +107,9 @@ def main() -> int:
             print(f"[vision_full] {name}: EXC {exc}", flush=True)
             ok = False
 
-    # Tower (TP=8 @pl.program, reused from vision_fwd).
+    # 8-card REPLICATED @pl.program stages (B' fix) — ir.compile, no specs
+    # needed (shapes resolve from the per_rank annotations).
     dist_cfg = DistributedConfig(device_ids=list(range(TP_WORLD_SIZE)), num_sub_workers=0)
-    prog_name = getattr(Step3p7Vision, "name", None) or type(Step3p7Vision).__name__
-    print(f"[vision_full] compiling tower {prog_name} tp={TP_WORLD_SIZE}", flush=True)
-    try:
-        compiled = ir.compile(
-            Step3p7Vision, platform=args.platform,
-            distributed_config=dist_cfg, skip_ptoas=False,
-        )
-        print(f"[vision_full] tower: OK output_dir={compiled.output_dir}", flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[vision_full] tower: FAIL {exc}", flush=True)
-        ok = False
-
-    # 8-card REPLICATED @pl.program stages (B' fix) — same ir.compile path as
-    # the tower; no specs needed (shapes resolve from the per_rank annotations).
     replicated = [
         (PatchEmbedProg, "PatchEmbedProg"),
         (LnPreProg,      "LnPreProg"),
@@ -143,7 +129,7 @@ def main() -> int:
             print(f"[vision_full] {name}: FAIL {exc}", flush=True)
             ok = False
 
-    print(f"[vision_full] {'OK' if ok else 'FAIL'} (5 @pl.jit + 5 @pl.program + tower)", flush=True)
+    print(f"[vision_full] {'OK' if ok else 'FAIL'} (5 @pl.jit + 5 @pl.program)", flush=True)
     return 0 if ok else 1
 
 
